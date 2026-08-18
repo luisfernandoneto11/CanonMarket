@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Callable
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi import Response
@@ -176,6 +176,10 @@ class CatalogProductResponse(BaseModel):
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[PublicSkuResponse]
+    image: str | None = None
+    price: int | None = None
+    in_stock: bool = True
+    is_in_cart: bool = False
 
 
 class CatalogResponse(BaseModel):
@@ -183,6 +187,34 @@ class CatalogResponse(BaseModel):
     total_count: int
     limit: int
     offset: int
+
+
+class FacetValue(BaseModel):
+    value: str
+    count: int
+
+
+class FacetGroup(BaseModel):
+    name: str
+    values: list[FacetValue]
+
+
+class FacetsResponse(BaseModel):
+    category_id: str | None = None
+    facets: list[FacetGroup]
+
+
+class CategoryFilter(BaseModel):
+    slug: str
+    name: str
+    type: str
+    value: list[str] | None = None
+    min: int | None = None
+    max: int | None = None
+
+
+class CategoryFiltersResponse(BaseModel):
+    items: list[CategoryFilter]
 
 
 class ReserveItem(BaseModel):
@@ -733,7 +765,13 @@ def _valid_b2c_service_key(value: str | None) -> bool:
     return value is not None and value == expected
 
 
+def _visible_skus(product: ProductResponse) -> list[SkuResponse]:
+    return [sku for sku in product.skus if sku.active_quantity > 0]
+
+
 def _to_catalog_product(product: ProductResponse) -> CatalogProductResponse:
+    visible_skus = _visible_skus(product)
+    cheapest = min(visible_skus, key=lambda sku: sku.price)
     return CatalogProductResponse(
         id=product.id,
         title=product.title,
@@ -753,10 +791,40 @@ def _to_catalog_product(product: ProductResponse) -> CatalogProductResponse:
                 active_quantity=sku.active_quantity,
                 characteristics=sku.characteristics,
             )
-            for sku in product.skus
-            if sku.active_quantity > 0
+            for sku in visible_skus
         ],
+        image=product.images[0].url if product.images else None,
+        price=cheapest.price,
+        in_stock=True,
     )
+
+
+def _catalog_filters(request: Request) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key.startswith("filters[") and key.endswith("]"):
+            filters[key[8:-1]] = value
+    return filters
+
+
+def _matches_catalog_filters(product: ProductResponse, filters: dict[str, str]) -> bool:
+    characteristics = {item.name.casefold(): item.value.casefold() for item in product.characteristics}
+    for name, expected in filters.items():
+        if characteristics.get(name.casefold()) != expected.casefold():
+            return False
+    return True
+
+
+def _catalog_sort_key(product: ProductResponse, sort: str) -> tuple[Any, ...]:
+    skus = _visible_skus(product)
+    if sort == "price_asc":
+        return (min(sku.price for sku in skus),)
+    if sort == "price_desc":
+        return (-min(sku.price for sku in skus),)
+    if sort == "discount_desc":
+        return (-max(sku.discount for sku in skus),)
+    # In-memory products are insertion ordered; this is deterministic for the MVP.
+    return (0,)
 
 
 @app.get(
@@ -765,11 +833,13 @@ def _to_catalog_product(product: ProductResponse) -> CatalogProductResponse:
     responses={401: {"model": ApiError}},
 )
 def list_catalog_products(
+    request: Request,
     limit: int = 20,
     offset: int = 0,
     category: str | None = None,
+    category_id: str | None = None,
     search: str | None = None,
-    sort: str = "date_desc",
+    sort: str = "rating",
     ids: str | None = None,
     x_service_key: Annotated[str | None, Header()] = None,
 ) -> CatalogResponse:
@@ -784,34 +854,38 @@ def list_catalog_products(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ApiError(code="INVALID_REQUEST", message="limit must be 1-100 and offset must be non-negative").model_dump(),
         )
-    if sort not in {"price_asc", "price_desc", "date_desc"}:
+    allowed_sorts = {"rating", "popularity", "price_asc", "price_desc", "date_desc", "discount_desc"}
+    if sort not in allowed_sorts:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ApiError(code="INVALID_REQUEST", message="Unsupported sort value").model_dump(),
+            detail=ApiError(code="INVALID_REQUEST", message="Invalid sort parameter. Allowed: rating, popularity, price_asc, price_desc, date_desc, discount_desc").model_dump(),
         )
 
+    if os.getenv("B2B_CATALOG_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+        raise HTTPException(status_code=502, detail=ApiError(code="B2B_UNAVAILABLE", message="Catalog temporarily unavailable").model_dump())
     requested_ids = None
     if ids:
         requested_ids = {item.strip() for item in ids.split(",") if item.strip()}
     normalized_search = search.casefold() if search else None
+    dynamic_filters = _catalog_filters(request)
+    category_id = category_id or category
     visible: list[ProductResponse] = []
     for product in store.products.values():
         if requested_ids is not None and product.id not in requested_ids:
             continue
         if product.status != "MODERATED" or product.deleted:
             continue
-        if category and product.category.id != category:
+        if category_id and product.category.id != category_id:
             continue
         if normalized_search and normalized_search not in f"{product.title} {product.description}".casefold():
+            continue
+        if not _matches_catalog_filters(product, dynamic_filters):
             continue
         if not any(sku.active_quantity > 0 for sku in product.skus):
             continue
         visible.append(product)
 
-    if sort == "price_asc":
-        visible.sort(key=lambda product: min(sku.price for sku in product.skus if sku.active_quantity > 0))
-    elif sort == "price_desc":
-        visible.sort(key=lambda product: min(sku.price for sku in product.skus if sku.active_quantity > 0), reverse=True)
+    visible.sort(key=lambda product: _catalog_sort_key(product, sort))
 
     total_count = len(visible)
     page = visible[offset : offset + limit]
@@ -821,6 +895,58 @@ def list_catalog_products(
         limit=limit,
         offset=offset,
     )
+
+
+@app.get(
+    "/api/v1/catalog/facets",
+    response_model=FacetsResponse,
+    responses={401: {"model": ApiError}, 502: {"model": ApiError}},
+)
+def catalog_facets(
+    request: Request,
+    category_id: str | None = None,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> FacetsResponse:
+    if not _valid_b2c_service_key(x_service_key):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    if os.getenv("B2B_CATALOG_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+        raise HTTPException(status_code=502, detail=ApiError(code="B2B_UNAVAILABLE", message="Catalog temporarily unavailable").model_dump())
+    dynamic_filters = _catalog_filters(request)
+    candidates = [
+        product for product in store.products.values()
+        if product.status == "MODERATED"
+        and not product.deleted
+        and any(sku.active_quantity > 0 for sku in product.skus)
+        and (not category_id or product.category.id == category_id)
+        and _matches_catalog_filters(product, dynamic_filters)
+    ]
+    counts: dict[str, dict[str, int]] = {}
+    for product in candidates:
+        for characteristic in product.characteristics:
+            counts.setdefault(characteristic.name, {})[characteristic.value] = counts.setdefault(characteristic.name, {}).get(characteristic.value, 0) + 1
+    return FacetsResponse(
+        category_id=category_id,
+        facets=[FacetGroup(name=name, values=[FacetValue(value=value, count=count) for value, count in sorted(values.items())]) for name, values in sorted(counts.items())],
+    )
+
+
+@app.get(
+    "/api/v1/categories/{category_id}/filters",
+    response_model=CategoryFiltersResponse,
+    responses={401: {"model": ApiError}, 502: {"model": ApiError}},
+)
+def category_filters(
+    category_id: str,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> CategoryFiltersResponse:
+    if not _valid_b2c_service_key(x_service_key):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    products = [product for product in store.products.values() if product.category.id == category_id and product.status == "MODERATED" and not product.deleted and any(sku.active_quantity > 0 for sku in product.skus)]
+    values: dict[str, set[str]] = {}
+    for product in products:
+        for characteristic in product.characteristics:
+            values.setdefault(characteristic.name, set()).add(characteristic.value)
+    return CategoryFiltersResponse(items=[CategoryFilter(slug=name, name=name, type="list", value=sorted(items)) for name, items in sorted(values.items())])
 
 
 @app.post(

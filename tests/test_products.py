@@ -695,3 +695,117 @@ def test_guest_cart_merged_on_login():
     assert response.json()["merged"] is True
     assert response.json()["items"][0]["quantity"] == 5
     assert client.get("/api/v1/cart", headers=guest_headers).json()["items"] == []
+
+
+# Task 8 — catalog filters and facets
+
+def test_catalog_filters_by_characteristic_and_sort():
+    first_id = make_moderated_product(active_quantity=5, title="Apple phone")
+    second_id = make_moderated_product(active_quantity=5, title="Samsung phone")
+    store.products[first_id].characteristics[0].value = "Apple"
+    store.products[second_id].characteristics[0].value = "Samsung"
+    store.products[first_id].skus[0].price = 200
+    store.products[second_id].skus[0].price = 100
+    response = client.get("/api/v1/products?filters[Brand]=Apple&sort=price_desc", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [first_id]
+
+
+def test_catalog_facets_returns_counts():
+    first_id = make_moderated_product(active_quantity=5)
+    second_id = make_moderated_product(active_quantity=5)
+    store.products[first_id].characteristics[0].value = "Apple"
+    store.products[second_id].characteristics[0].value = "Apple"
+    response = client.get("/api/v1/catalog/facets", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    brand = next(group for group in response.json()["facets"] if group["name"] == "Brand")
+    assert brand["values"] == [{"value": "Apple", "count": 2}]
+
+
+def test_catalog_invalid_sort_returns_400():
+    response = client.get("/api/v1/products?sort=unsupported", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_REQUEST"
+
+
+def test_catalog_b2b_unavailable_returns_502(monkeypatch):
+    monkeypatch.setenv("B2B_CATALOG_UNAVAILABLE", "1")
+    response = client.get("/api/v1/products", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 502
+    assert response.json()["code"] == "B2B_UNAVAILABLE"
+    monkeypatch.delenv("B2B_CATALOG_UNAVAILABLE", raising=False)
+
+
+def test_category_filters_return_visible_values():
+    make_moderated_product(active_quantity=5)
+    response = client.get("/api/v1/categories/" + CATEGORY_ID + "/filters", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert response.json()["items"]
+
+
+def test_catalog_facets_exclude_unavailable_products():
+    make_moderated_product(active_quantity=0)
+    response = client.get("/api/v1/catalog/facets", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert response.json()["facets"] == []
+
+
+def test_catalog_batch_ids_omit_unknown_products():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.get(f"/api/v1/products?ids={product_id},missing", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [product_id]
+
+
+def test_catalog_pagination_preserves_total_count():
+    make_moderated_product(active_quantity=5)
+    make_moderated_product(active_quantity=5)
+    response = client.get("/api/v1/products?limit=1&offset=1", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert response.json()["total_count"] == 2
+    assert len(response.json()["items"]) == 1
+
+
+def test_catalog_public_sku_excludes_sensitive_fields():
+    make_moderated_product(active_quantity=5)
+    response = client.get("/api/v1/products", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    sku = response.json()["items"][0]["skus"][0]
+    assert "cost_price" not in sku
+    assert "reserved_quantity" not in sku
+
+
+def test_catalog_facets_require_service_key():
+    assert client.get("/api/v1/catalog/facets").status_code == 401
+
+
+def test_category_filters_require_service_key():
+    assert client.get("/api/v1/categories/" + CATEGORY_ID + "/filters").status_code == 401
+
+
+def test_catalog_search_and_category_filters_combine():
+    product_id = make_moderated_product(active_quantity=5, title="Wireless Apple phone")
+    response = client.get(f"/api/v1/products?category_id={CATEGORY_ID}&search=Apple", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [product_id]
+
+
+def test_catalog_supported_sorts_return_success():
+    for sort in ["rating", "popularity", "price_asc", "price_desc", "date_desc", "discount_desc"]:
+        response = client.get(f"/api/v1/products?sort={sort}", headers={"X-Service-Key": "development-service-key"})
+        assert response.status_code == 200
+
+
+def test_catalog_facets_are_computed_from_visible_stock():
+    product_id = make_moderated_product(active_quantity=5)
+    before = client.get("/api/v1/catalog/facets", headers={"X-Service-Key": "development-service-key"})
+    store.products[product_id].skus[0].active_quantity = 0
+    after = client.get("/api/v1/catalog/facets", headers={"X-Service-Key": "development-service-key"})
+    assert before.json() != after.json()
+
+
+def test_category_filters_include_dynamic_characteristics():
+    make_moderated_product(active_quantity=5)
+    response = client.get("/api/v1/categories/" + CATEGORY_ID + "/filters", headers={"X-Service-Key": "development-service-key"})
+    assert response.status_code == 200
+    assert any(item["name"] == "Brand" for item in response.json()["items"])
