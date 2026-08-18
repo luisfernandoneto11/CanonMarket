@@ -411,6 +411,55 @@ class CartMergeResponse(BaseModel):
     items: list[CartStoredItem]
 
 
+class OrderCreateItem(BaseModel):
+    sku_id: str
+    quantity: int = Field(ge=1)
+
+    @field_validator("sku_id")
+    @classmethod
+    def sku_id_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("sku_id must be a valid UUID") from None
+        return value
+
+
+class OrderCreateRequest(BaseModel):
+    items: list[OrderCreateItem] = Field(min_length=1)
+    idempotency_key: str
+    delivery_address: str | None = None
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def idempotency_key_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("idempotency_key must be a valid UUID") from None
+        return value
+
+
+class OrderItemResponse(BaseModel):
+    sku_id: str
+    product_id: str
+    product_title: str
+    sku_name: str
+    quantity: int
+    unit_price: int
+    line_total: int
+
+
+class OrderResponse(BaseModel):
+    id: str
+    user_id: str
+    status: str
+    total_amount: int
+    idempotency_key: str
+    delivery_address: str | None = None
+    items: list[OrderItemResponse]
+
+
 class ModerationEvent(BaseModel):
     idempotency_key: str
     product_id: str
@@ -456,6 +505,8 @@ class ProductStore:
     b2c_events: list[dict[str, Any]] = field(default_factory=list)
     processed_moderation_events: set[str] = field(default_factory=set)
     cart_items: dict[str, dict[str, Any]] = field(default_factory=dict)
+    orders: dict[str, OrderResponse] = field(default_factory=dict)
+    orders_by_idempotency: dict[str, str] = field(default_factory=dict)
 
     def _find_sku(self, sku_id: str) -> tuple[ProductResponse | None, SkuResponse | None]:
         for product in self.products.values():
@@ -657,6 +708,66 @@ class ProductStore:
                 }
             )
         return result
+
+    def create_order(self, user_id: str, payload: OrderCreateRequest) -> tuple[OrderResponse, bool]:
+        existing_id = self.orders_by_idempotency.get(payload.idempotency_key)
+        if existing_id is not None:
+            return self.orders[existing_id], False
+
+        quantities: dict[str, int] = {}
+        for item in payload.items:
+            quantities[item.sku_id] = quantities.get(item.sku_id, 0) + item.quantity
+
+        snapshots: list[tuple[ProductResponse, SkuResponse, int]] = []
+        failed: list[ReserveFailedItem] = []
+        for sku_id, quantity in quantities.items():
+            product, sku = self._find_sku(sku_id)
+            if product is None or sku is None:
+                failed.append(ReserveFailedItem(sku_id=sku_id, requested=quantity, available=0, reason="SKU_NOT_FOUND"))
+            elif product.deleted:
+                failed.append(ReserveFailedItem(sku_id=sku_id, requested=quantity, available=sku.active_quantity, reason="PRODUCT_DELETED"))
+            elif product.status in {"BLOCKED", "HARD_BLOCKED"} or product.blocked:
+                failed.append(ReserveFailedItem(sku_id=sku_id, requested=quantity, available=sku.active_quantity, reason="PRODUCT_BLOCKED"))
+            elif sku.active_quantity < quantity:
+                reason = "OUT_OF_STOCK" if sku.active_quantity == 0 else "INSUFFICIENT_STOCK"
+                failed.append(ReserveFailedItem(sku_id=sku_id, requested=quantity, available=sku.active_quantity, reason=reason))
+            else:
+                snapshots.append((product, sku, quantity))
+        if failed:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "RESERVE_FAILED", "message": "Unable to reserve all requested items", "failed_items": [item.model_dump() for item in failed]})
+
+        reserve_payload = ReserveRequest(
+            idempotency_key=payload.idempotency_key,
+            items=[ReserveItem(sku_id=sku_id, quantity=quantity) for sku_id, quantity in quantities.items()],
+        )
+        reserved = self.reserve(reserve_payload)
+        if not reserved.reserved:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "RESERVE_FAILED", "message": "Unable to reserve all requested items", "failed_items": [item.model_dump() for item in reserved.failed_items]})
+
+        order_items = [
+            OrderItemResponse(
+                sku_id=sku.id,
+                product_id=product.id,
+                product_title=product.title,
+                sku_name=sku.name,
+                quantity=quantity,
+                unit_price=sku.price,
+                line_total=sku.price * quantity,
+            )
+            for product, sku, quantity in snapshots
+        ]
+        order = OrderResponse(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            status="PAID",
+            total_amount=sum(item.line_total for item in order_items),
+            idempotency_key=payload.idempotency_key,
+            delivery_address=payload.delivery_address,
+            items=order_items,
+        )
+        self.orders[order.id] = order
+        self.orders_by_idempotency[payload.idempotency_key] = order.id
+        return order, True
 
     def unreserve(self, payload: UnreserveRequest) -> UnreserveResponse:
         cached = self.unreserve_operations.get(payload.order_id)
@@ -1121,6 +1232,18 @@ def unreserve_skus(
     return store.unreserve(payload)
 
 
+def get_checkout_user_id(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Bearer token is required").model_dump())
+    try:
+        claims = _decode_jwt_payload(authorization[7:].strip())
+        user_id = claims.get("sub") or claims.get("user_id")
+        uuid.UUID(str(user_id))
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="user_id claim is required").model_dump()) from None
+    return str(user_id)
+
+
 def get_cart_identity(
     authorization: Annotated[str | None, Header()] = None,
     x_session_id: Annotated[str | None, Header()] = None,
@@ -1142,6 +1265,28 @@ def get_cart_identity(
     except ValueError:
         raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="X-Session-Id must be a valid UUID").model_dump()) from None
     return "session", x_session_id
+
+
+@app.post(
+    "/api/v1/orders",
+    response_model=OrderResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 409: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def create_order(
+    payload: OrderCreateRequest,
+    response: Response,
+    authorization: Annotated[str | None, Header()] = None,
+) -> OrderResponse:
+    user_id = get_checkout_user_id(authorization)
+    existing_id = store.orders_by_idempotency.get(payload.idempotency_key)
+    if existing_id is not None:
+        response.status_code = status.HTTP_200_OK
+        return store.orders[existing_id]
+    if os.getenv("B2B_CHECKOUT_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+        raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Product service temporarily unavailable").model_dump())
+    order, _ = store.create_order(user_id, payload)
+    return order
 
 
 @app.post(
