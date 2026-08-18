@@ -256,6 +256,44 @@ class UnreserveResponse(BaseModel):
     ok: bool
 
 
+class ModerationDecisionRequest(BaseModel):
+    idempotency_key: str
+    product_id: str
+    status: str
+    hard_block: bool = False
+    blocking_reason: BlockingReason | None = None
+    field_reports: list[FieldReport] = Field(default_factory=list)
+
+    @field_validator("idempotency_key", "product_id")
+    @classmethod
+    def identifiers_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("identifier must be a valid UUID") from None
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def status_must_be_supported(cls, value: str) -> str:
+        if value not in {"MODERATED", "BLOCKED"}:
+            raise ValueError("status must be MODERATED or BLOCKED")
+        return value
+
+
+class ModerationDecisionResponse(BaseModel):
+    ok: bool
+
+
+class UpdateProductRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, min_length=1, max_length=5000)
+
+
+class DeleteResponse(BaseModel):
+    deleted: bool
+
+
 class ModerationEvent(BaseModel):
     idempotency_key: str
     product_id: str
@@ -299,6 +337,39 @@ class ProductStore:
     reserve_operations: dict[str, ReserveResponse] = field(default_factory=dict)
     unreserve_operations: dict[str, UnreserveResponse] = field(default_factory=dict)
     b2c_events: list[dict[str, Any]] = field(default_factory=list)
+    processed_moderation_events: set[str] = field(default_factory=set)
+
+    def apply_moderation(self, payload: ModerationDecisionRequest) -> ModerationDecisionResponse:
+        if payload.idempotency_key in self.processed_moderation_events:
+            return ModerationDecisionResponse(ok=True)
+        product = self.products.get(payload.product_id)
+        if product is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
+            )
+
+        if payload.status == "MODERATED":
+            product.status = "MODERATED"
+            product.blocked = False
+            product.blocking_reason = None
+            product.field_reports = []
+        else:
+            product.status = "HARD_BLOCKED" if payload.hard_block else "BLOCKED"
+            product.blocked = True
+            product.blocking_reason = payload.blocking_reason
+            product.field_reports = payload.field_reports
+            self.b2c_events.append(
+                {
+                    "idempotency_key": str(uuid.uuid4()),
+                    "event": "PRODUCT_BLOCKED",
+                    "product_id": product.id,
+                    "sku_ids": [sku.id for sku in product.skus],
+                    "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+            )
+        self.processed_moderation_events.add(payload.idempotency_key)
+        return ModerationDecisionResponse(ok=True)
 
     def create(self, payload: CreateProductRequest, seller_id: str) -> ProductResponse:
         product_id = str(uuid.uuid4())
@@ -712,6 +783,76 @@ def unreserve_skus(
             detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump(),
         )
     return store.unreserve(payload)
+
+
+def _valid_moderation_service_key(value: str | None) -> bool:
+    expected = os.getenv("MOD_TO_B2B_KEY", "development-service-key")
+    return value is not None and value == expected
+
+
+@app.post(
+    "/api/v1/events/moderation",
+    response_model=ModerationDecisionResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def apply_moderation_event(
+    payload: ModerationDecisionRequest,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> ModerationDecisionResponse:
+    if not _valid_moderation_service_key(x_service_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump(),
+        )
+    return store.apply_moderation(payload)
+
+
+@app.put(
+    "/api/v1/products/{product_id}",
+    response_model=ProductResponse,
+    responses={401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def update_product(
+    product_id: str,
+    payload: UpdateProductRequest,
+    seller_id: Annotated[str, Depends(get_seller_id)],
+) -> ProductResponse:
+    product = store.products.get(product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+    if product.seller_id != seller_id:
+        raise HTTPException(status_code=403, detail=ApiError(code="NOT_OWNER", message="Product does not belong to the authenticated seller").model_dump())
+    if product.status == "HARD_BLOCKED":
+        raise HTTPException(status_code=403, detail=ApiError(code="FORBIDDEN", message="Cannot edit hard-blocked product").model_dump())
+    if payload.title is not None:
+        product.title = payload.title
+    if payload.description is not None:
+        product.description = payload.description
+    if product.status in {"MODERATED", "BLOCKED"}:
+        product.status = "ON_MODERATION"
+        product.blocked = False
+    return product
+
+
+@app.delete(
+    "/api/v1/products/{product_id}",
+    response_model=DeleteResponse,
+    responses={401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def delete_product(
+    product_id: str,
+    seller_id: Annotated[str, Depends(get_seller_id)],
+) -> DeleteResponse:
+    product = store.products.get(product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+    if product.seller_id != seller_id:
+        raise HTTPException(status_code=403, detail=ApiError(code="NOT_OWNER", message="Product does not belong to the authenticated seller").model_dump())
+    if product.status == "HARD_BLOCKED":
+        raise HTTPException(status_code=403, detail=ApiError(code="FORBIDDEN", message="Cannot delete hard-blocked product").model_dump())
+    product.deleted = True
+    product.status = "DELETED"
+    return DeleteResponse(deleted=True)
 
 
 @app.get("/health")
