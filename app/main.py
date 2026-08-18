@@ -127,6 +127,18 @@ class SkuResponse(BaseModel):
     characteristics: list[Characteristic]
 
 
+class BlockingReason(BaseModel):
+    id: str
+    title: str
+    comment: str
+
+
+class FieldReport(BaseModel):
+    field_name: str
+    sku_id: str | None = None
+    comment: str
+
+
 class ProductResponse(BaseModel):
     id: str
     seller_id: str
@@ -139,6 +151,8 @@ class ProductResponse(BaseModel):
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[SkuResponse]
+    blocking_reason: BlockingReason | None = None
+    field_reports: list[FieldReport] = Field(default_factory=list)
 
 
 class ModerationEvent(BaseModel):
@@ -199,6 +213,8 @@ class ProductStore:
             images=payload.images,
             characteristics=payload.characteristics,
             skus=[],
+            blocking_reason=None,
+            field_reports=[],
         )
         self.products[product_id] = product
         return product
@@ -339,6 +355,55 @@ def create_sku(
         )
     sku, _ = store.add_sku(payload)
     return sku
+
+
+@app.get(
+    "/api/v1/products/{product_id}",
+    response_model=ProductResponse,
+    responses={401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def get_product(
+    product_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> ProductResponse:
+    """Return a seller-owned product or a Moderation-authorized product.
+
+    Seller access deliberately returns 404 for another seller's product to avoid
+    revealing whether the resource exists. Moderation may use X-Service-Key to
+    inspect any seller's product while building a moderation diff.
+    """
+    try:
+        uuid.UUID(product_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
+        ) from None
+
+    product = store.products.get(product_id)
+    if product is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
+        )
+
+    expected_service_key = os.getenv("B2B_TO_MOD_KEY", "development-service-key")
+    if x_service_key is not None:
+        if x_service_key != expected_service_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ApiError(code="UNAUTHORIZED", message="Invalid service key").model_dump(),
+            )
+        return product
+
+    seller_id = get_seller_id(authorization)
+    if product.seller_id != seller_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
+        )
+    return product
 
 
 @app.get("/health")
