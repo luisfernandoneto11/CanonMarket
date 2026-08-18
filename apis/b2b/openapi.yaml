@@ -186,6 +186,7 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FieldReport"
+
     PublicSkuResponse:
       type: object
       required: [id, product_id, name, price, discount, image, active_quantity, characteristics]
@@ -258,6 +259,8 @@ components:
           type: integer
         offset:
           type: integer
+
+
 
 paths:
   /api/v1/products:
