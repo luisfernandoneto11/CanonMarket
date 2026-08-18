@@ -327,6 +327,30 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/ReserveItem"
+    ModerationDecisionRequest:
+      type: object
+      required: [idempotency_key, product_id, status]
+      properties:
+        idempotency_key:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [MODERATED, BLOCKED]
+        hard_block:
+          type: boolean
+          default: false
+        blocking_reason:
+          allOf:
+            - $ref: "#/components/schemas/BlockingReason"
+          nullable: true
+        field_reports:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldReport"
 
 paths:
   /api/v1/products:
@@ -468,6 +492,38 @@ paths:
           description: X-Service-Key ausente ou inválido
         "409":
           description: Reserved quantity is insufficient
+
+  /api/v1/events/moderation:
+    post:
+      summary: Apply a moderation decision to a product
+      tags: [Moderation]
+      security:
+        - serviceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModerationDecisionRequest"
+      responses:
+        "200":
+          description: Decision accepted; duplicate idempotency keys are no-ops
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+        "401":
+          description: X-Service-Key ausente ou inválido
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 
   /api/v1/products/{id}:
     get:

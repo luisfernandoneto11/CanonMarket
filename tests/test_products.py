@@ -59,6 +59,7 @@ def setup_function():
     store.reserve_operations.clear()
     store.unreserve_operations.clear()
     store.b2c_events.clear()
+    store.processed_moderation_events.clear()
 
 
 def test_create_product_returns_201_with_created_status():
@@ -506,3 +507,106 @@ def test_unreserve_restores_quantities():
     sku = next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id)
     assert sku.active_quantity == 5
     assert sku.reserved_quantity == 0
+
+
+def moderation_payload(product_id: str, key: str, status: str = "MODERATED", hard_block: bool = False) -> dict:
+    payload = {"idempotency_key": key, "product_id": product_id, "status": status, "hard_block": hard_block}
+    if status == "BLOCKED":
+        payload["blocking_reason"] = {
+            "id": "a7b8c9d0-1234-5678-ef01-890123456789",
+            "title": "Description does not match",
+            "comment": "Fix the description",
+        }
+        payload["field_reports"] = [{"field_name": "description", "sku_id": None, "comment": "Correct it"}]
+    return payload
+
+
+def test_moderated_event_clears_blocking_data():
+    product_id = create_product(status="BLOCKED")
+    product = store.products[product_id]
+    product.blocked = True
+    product.blocking_reason = BlockingReason(id="a7b8c9d0-1234-5678-ef01-890123456789", title="Old", comment="Old")
+    product.field_reports = [FieldReport(field_name="description", comment="Old")]
+
+    response = client.post(
+        "/api/v1/events/moderation",
+        json=moderation_payload(product_id, "77777777-7777-4777-8777-777777777777"),
+        headers={"X-Service-Key": "development-service-key"},
+    )
+
+    assert response.status_code == 200
+    assert product.status == "MODERATED"
+    assert product.blocked is False
+    assert product.blocking_reason is None
+    assert product.field_reports == []
+
+
+def test_blocked_soft_saves_field_reports():
+    product_id = create_product()
+
+    response = client.post(
+        "/api/v1/events/moderation",
+        json=moderation_payload(product_id, "88888888-8888-4888-8888-888888888888", "BLOCKED"),
+        headers={"X-Service-Key": "development-service-key"},
+    )
+
+    assert response.status_code == 200
+    assert store.products[product_id].status == "BLOCKED"
+    assert store.products[product_id].field_reports[0].field_name == "description"
+    assert store.b2c_events[-1]["event"] == "PRODUCT_BLOCKED"
+
+
+def test_blocked_hard_sets_terminal_status():
+    product_id = create_product()
+
+    response = client.post(
+        "/api/v1/events/moderation",
+        json=moderation_payload(product_id, "99999999-9999-4999-8999-999999999999", "BLOCKED", True),
+        headers={"X-Service-Key": "development-service-key"},
+    )
+
+    assert response.status_code == 200
+    assert store.products[product_id].status == "HARD_BLOCKED"
+    assert store.products[product_id].blocked is True
+    assert store.b2c_events[-1]["event"] == "PRODUCT_BLOCKED"
+
+
+def test_hard_blocked_product_rejects_seller_edits():
+    product_id = create_product(status="HARD_BLOCKED")
+
+    update = client.put(
+        f"/api/v1/products/{product_id}",
+        json={"title": "Changed"},
+        headers={"Authorization": f"Bearer {jwt_for()}"},
+    )
+    delete = client.delete(
+        f"/api/v1/products/{product_id}",
+        headers={"Authorization": f"Bearer {jwt_for()}"},
+    )
+
+    assert update.status_code == 403
+    assert delete.status_code == 403
+
+
+def test_duplicate_event_same_idempotency_key_no_side_effects():
+    product_id = create_product()
+    payload = moderation_payload(product_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "BLOCKED")
+    headers = {"X-Service-Key": "development-service-key"}
+
+    first = client.post("/api/v1/events/moderation", json=payload, headers=headers)
+    event_count = len(store.b2c_events)
+    second = client.post("/api/v1/events/moderation", json=payload, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(store.b2c_events) == event_count
+    assert store.products[product_id].status == "BLOCKED"
+
+
+def test_moderation_event_missing_service_key_returns_401():
+    product_id = create_product()
+    response = client.post(
+        "/api/v1/events/moderation",
+        json=moderation_payload(product_id, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+    )
+    assert response.status_code == 401
