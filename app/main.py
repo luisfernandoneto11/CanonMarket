@@ -155,6 +155,7 @@ class ProductResponse(BaseModel):
     field_reports: list[FieldReport] = Field(default_factory=list)
 
 
+
 class PublicSkuResponse(BaseModel):
     id: str
     product_id: str

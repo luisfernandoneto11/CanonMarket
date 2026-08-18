@@ -186,6 +186,7 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FieldReport"
+
     PublicSkuResponse:
       type: object
       required: [id, product_id, name, price, discount, image, active_quantity, characteristics]
@@ -327,6 +328,8 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/ReserveItem"
+
+
 
 paths:
   /api/v1/products:

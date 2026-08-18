@@ -314,6 +314,7 @@ def test_get_nonexistent_returns_404():
     assert response.json() == {"code": "NOT_FOUND", "message": "Product not found"}
 
 
+
 def make_moderated_product(active_quantity: int = 5, title: str = "Visible phone") -> str:
     product_id = create_product()
     product = store.products[product_id]
@@ -386,6 +387,7 @@ def test_batch_ids_returns_visible_subset():
 
     assert response.status_code == 200
     assert [item["id"] for item in response.json()["items"]] == [visible_id]
+
 
 
 def make_reservable_sku(active_quantity: int = 5) -> str:
