@@ -155,6 +155,36 @@ class ProductResponse(BaseModel):
     field_reports: list[FieldReport] = Field(default_factory=list)
 
 
+
+class PublicSkuResponse(BaseModel):
+    id: str
+    product_id: str
+    name: str
+    price: int
+    discount: int
+    image: str
+    active_quantity: int
+    characteristics: list[Characteristic]
+
+
+class CatalogProductResponse(BaseModel):
+    id: str
+    title: str
+    description: str
+    status: str
+    category: CategoryRef
+    images: list[Image]
+    characteristics: list[Characteristic]
+    skus: list[PublicSkuResponse]
+
+
+class CatalogResponse(BaseModel):
+    items: list[CatalogProductResponse]
+    total_count: int
+    limit: int
+    offset: int
+
+
 class ModerationEvent(BaseModel):
     idempotency_key: str
     product_id: str
@@ -316,6 +346,101 @@ async def request_validation_exception_handler(request, exc: RequestValidationEr
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content=ApiError(code="INVALID_REQUEST", message=message).model_dump(),
+    )
+
+
+def _valid_b2c_service_key(value: str | None) -> bool:
+    expected = os.getenv("B2C_TO_B2B_KEY", "development-service-key")
+    return value is not None and value == expected
+
+
+def _to_catalog_product(product: ProductResponse) -> CatalogProductResponse:
+    return CatalogProductResponse(
+        id=product.id,
+        title=product.title,
+        description=product.description,
+        status=product.status,
+        category=product.category,
+        images=product.images,
+        characteristics=product.characteristics,
+        skus=[
+            PublicSkuResponse(
+                id=sku.id,
+                product_id=sku.product_id,
+                name=sku.name,
+                price=sku.price,
+                discount=sku.discount,
+                image=sku.image,
+                active_quantity=sku.active_quantity,
+                characteristics=sku.characteristics,
+            )
+            for sku in product.skus
+            if sku.active_quantity > 0
+        ],
+    )
+
+
+@app.get(
+    "/api/v1/products",
+    response_model=CatalogResponse,
+    responses={401: {"model": ApiError}},
+)
+def list_catalog_products(
+    limit: int = 20,
+    offset: int = 0,
+    category: str | None = None,
+    search: str | None = None,
+    sort: str = "date_desc",
+    ids: str | None = None,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> CatalogResponse:
+    """Return only visible, in-stock MODERATED products for B2C."""
+    if not _valid_b2c_service_key(x_service_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump(),
+        )
+    if limit < 1 or limit > 100 or offset < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ApiError(code="INVALID_REQUEST", message="limit must be 1-100 and offset must be non-negative").model_dump(),
+        )
+    if sort not in {"price_asc", "price_desc", "date_desc"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ApiError(code="INVALID_REQUEST", message="Unsupported sort value").model_dump(),
+        )
+
+    requested_ids = None
+    if ids:
+        requested_ids = {item.strip() for item in ids.split(",") if item.strip()}
+    normalized_search = search.casefold() if search else None
+    visible: list[ProductResponse] = []
+    for product in store.products.values():
+        if requested_ids is not None and product.id not in requested_ids:
+            continue
+        if product.status != "MODERATED" or product.deleted:
+            continue
+        if category and product.category.id != category:
+            continue
+        if normalized_search and normalized_search not in f"{product.title} {product.description}".casefold():
+            continue
+        if not any(sku.active_quantity > 0 for sku in product.skus):
+            continue
+        visible.append(product)
+
+    if sort == "price_asc":
+        visible.sort(key=lambda product: min(sku.price for sku in product.skus if sku.active_quantity > 0))
+    elif sort == "price_desc":
+        visible.sort(key=lambda product: min(sku.price for sku in product.skus if sku.active_quantity > 0), reverse=True)
+
+    total_count = len(visible)
+    page = visible[offset : offset + limit]
+    return CatalogResponse(
+        items=[_to_catalog_product(product) for product in page],
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
     )
 
 
