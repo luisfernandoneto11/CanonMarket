@@ -3,7 +3,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from app.main import app, store
+from app.main import BlockingReason, FieldReport, app, store
 
 
 client = TestClient(app)
@@ -232,3 +232,80 @@ def test_sku_owner_is_taken_from_jwt():
 
     assert response.status_code == 403
     assert response.json()["code"] == "NOT_OWNER"
+
+
+def test_get_moderated_product_returns_full_payload():
+    product_id = create_product()
+    product = store.products[product_id]
+    product.status = "MODERATED"
+    sku_response = client.post(
+        "/api/v1/skus", json=sku_payload(product_id), headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert sku_response.status_code == 201
+    product.status = "MODERATED"
+
+    response = client.get(
+        f"/api/v1/products/{product_id}", headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "MODERATED"
+    assert body["title"] == "iPhone 15 Pro Max"
+    assert body["description"] == "Flagship smartphone"
+    assert body["skus"][0]["cost_price"] == 9500000
+    assert body["skus"][0]["reserved_quantity"] == 0
+    assert body["blocking_reason"] is None
+    assert body["field_reports"] == []
+
+
+def test_get_blocked_product_returns_blocking_reason_and_field_reports():
+    product_id = create_product()
+    product = store.products[product_id]
+    product.status = "BLOCKED"
+    product.blocked = True
+    product.blocking_reason = BlockingReason(
+        id="a7b8c9d0-1234-5678-ef01-890123456789",
+        title="Description does not match product",
+        comment="Description and photos do not match",
+    )
+    product.field_reports = [
+        FieldReport(
+            field_name="description",
+            sku_id=None,
+            comment="Correct the material description",
+        )
+    ]
+
+    response = client.get(
+        f"/api/v1/products/{product_id}", headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "BLOCKED"
+    assert body["blocked"] is True
+    assert body["blocking_reason"]["title"] == "Description does not match product"
+    assert body["field_reports"][0]["field_name"] == "description"
+    assert body["field_reports"][0]["sku_id"] is None
+
+
+def test_get_others_product_returns_404():
+    product_id = create_product(seller_id=OTHER_SELLER_ID)
+
+    response = client.get(
+        f"/api/v1/products/{product_id}", headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"code": "NOT_FOUND", "message": "Product not found"}
+
+
+def test_get_nonexistent_returns_404():
+    response = client.get(
+        "/api/v1/products/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        headers={"Authorization": f"Bearer {jwt_for()}"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"code": "NOT_FOUND", "message": "Product not found"}

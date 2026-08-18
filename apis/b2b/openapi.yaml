@@ -12,6 +12,10 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    serviceKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Service-Key
   schemas:
     ApiError:
       type: object
@@ -109,6 +113,79 @@ components:
           type: array
           items:
             $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+    BlockingReason:
+      type: object
+      required: [id, title, comment]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        comment:
+          type: string
+    FieldReport:
+      type: object
+      required: [field_name, comment]
+      properties:
+        field_name:
+          type: string
+          enum: [title, description, product_images, category, sku_name, sku_image, sku_price]
+        sku_id:
+          type: string
+          format: uuid
+          nullable: true
+        comment:
+          type: string
+    ProductDetail:
+      type: object
+      required: [id, seller_id, title, description, status, deleted, blocked, category, images, characteristics, skus, blocking_reason, field_reports]
+      properties:
+        id:
+          type: string
+          format: uuid
+        seller_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [CREATED, ON_MODERATION, MODERATED, BLOCKED, HARD_BLOCKED, DELETED]
+        deleted:
+          type: boolean
+        blocked:
+          type: boolean
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+        images:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/Image"
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+        skus:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkuResponse"
+        blocking_reason:
+          allOf:
+            - $ref: "#/components/schemas/BlockingReason"
+          nullable: true
+        field_reports:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldReport"
 
 paths:
   /api/v1/products:
@@ -145,51 +222,37 @@ paths:
 
   /api/v1/products/{id}:
     get:
-      summary: Получить товар со всеми SKU
+      summary: Получить товар со всеми SKU и причинами блокировки
       tags: [Products]
+      security:
+        - bearerAuth: []
+        - serviceKeyAuth: []
       parameters:
         - name: id
           in: path
           required: true
           schema:
-            type: integer
+            type: string
+            format: uuid
       responses:
         "200":
-          description: Товар с SKU, характеристиками и фото
+          description: Полная карточка товара в seller-режиме
           content:
             application/json:
               schema:
-                $ref: "../shared/schemas.yaml#/components/schemas/Product"
-              example:
-                id: 42
-                title: "iPhone 15 Pro Max"
-                description: "Флагман Apple..."
-                status: "MODERATED"
-                category:
-                  id: 3
-                  name: "Смартфоны"
-                images:
-                  - url: "/s3/iphone15-1.jpg"
-                    ordering: 0
-                characteristics:
-                  - name: "Бренд"
-                    value: "Apple"
-                skus:
-                  - id: 101
-                    name: "256GB Black"
-                    price: 12999000
-                    activeQuantity: 5
-                    characteristics:
-                      - name: "Цвет"
-                        value: "Чёрный"
-                      - name: "Объём памяти"
-                        value: "256 ГБ"
-                  - id: 102
-                    name: "256GB White"
-                    price: 12999000
-                    activeQuantity: 0
+                $ref: "#/components/schemas/ProductDetail"
+        "401":
+          description: Отсутствует или некорректен JWT или service key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
         "404":
-          description: Товар не найден
+          description: Товар не найден или не принадлежит продавцу
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 
     put:
       summary: Изменить товар
