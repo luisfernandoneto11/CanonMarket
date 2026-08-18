@@ -1,0 +1,54 @@
+name: Link Validator
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate-links:
+    name: Validate internal markdown links
+    runs-on: ubuntu-latest
+    continue-on-error: true  # warning-only
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check internal markdown links in flows/
+        run: |
+          echo "Checking internal markdown links in flows/..."
+          broken=0
+          while IFS= read -r -d '' mdfile; do
+            dir=$(dirname "$mdfile")
+            # Extract markdown links [text](path)
+            while IFS= read -r link; do
+              # Skip external URLs
+              if echo "$link" | grep -qP '^https?://'; then
+                continue
+              fi
+              # Skip anchors only
+              if echo "$link" | grep -qP '^#'; then
+                continue
+              fi
+              # Strip anchor fragment
+              target="${link%%#*}"
+              # Resolve relative path
+              if [ -n "$target" ]; then
+                fullpath="$dir/$target"
+                if [ ! -f "$fullpath" ]; then
+                  echo "::warning file=$mdfile::Broken link: [$link] -> $fullpath not found"
+                  broken=1
+                fi
+              fi
+            done < <(grep -oP '(?<=\]\()[^)]+' "$mdfile" 2>/dev/null || true)
+          done < <(find flows/ -name "*.md" -print0 2>/dev/null || true)
+
+          if [ "$broken" -eq 1 ]; then
+            echo "::warning::Link Validator: some internal links are broken. Please fix before merging."
+          else
+            echo "All internal links OK."
+          fi
+
+      - name: Summary
+        if: always()
+        run: echo "Link validation complete (warning-only mode)."

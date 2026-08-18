@@ -1,0 +1,103 @@
+name: Schema Syntax
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate-frontmatter:
+    name: Validate YAML front-matter
+    runs-on: ubuntu-latest
+    continue-on-error: true  # warning-only
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Validate front-matter in flows/
+        run: |
+          python3 << 'EOF'
+          import os
+          import sys
+          import yaml
+
+          REQUIRED_FIELDS = {"artifact", "status", "last_modified", "canon_version"}
+          VALID_STATUSES = {"aspirational", "aligned", "deprecated"}
+          warnings = []
+
+          flows_dir = "flows"
+          if not os.path.isdir(flows_dir):
+              print("flows/ directory not found, skipping.")
+              sys.exit(0)
+
+          for fname in os.listdir(flows_dir):
+              if not fname.endswith(".md"):
+                  continue
+              fpath = os.path.join(flows_dir, fname)
+              with open(fpath, encoding="utf-8") as f:
+                  content = f.read()
+
+              if not content.startswith("---"):
+                  warnings.append(f"  {fpath}: missing front-matter (no leading ---)")
+                  continue
+
+              # Extract YAML block
+              end = content.find("---", 3)
+              if end == -1:
+                  warnings.append(f"  {fpath}: malformed front-matter (no closing ---)")
+                  continue
+
+              yaml_str = content[3:end]
+              try:
+                  fm = yaml.safe_load(yaml_str)
+              except yaml.YAMLError as e:
+                  warnings.append(f"  {fpath}: invalid YAML in front-matter: {e}")
+                  continue
+
+              if not isinstance(fm, dict):
+                  warnings.append(f"  {fpath}: front-matter is not a dict")
+                  continue
+
+              missing = REQUIRED_FIELDS - set(fm.keys())
+              if missing:
+                  warnings.append(f"  {fpath}: missing fields: {missing}")
+
+              status = fm.get("status")
+              if status and status not in VALID_STATUSES:
+                  warnings.append(f"  {fpath}: invalid status '{status}', must be one of {VALID_STATUSES}")
+
+          if warnings:
+              print("Front-matter warnings:")
+              for w in warnings:
+                  print(w)
+              print("\n::warning::Schema Syntax: front-matter issues found (see above). Not blocking.")
+          else:
+              print("All front-matter valid.")
+          EOF
+
+      - name: Check mermaid blocks syntax (basic)
+        run: |
+          echo "Checking mermaid blocks for obvious syntax errors..."
+          while IFS= read -r -d '' file; do
+            # Basic check: mermaid blocks should not be empty
+            python3 -c "
+          import sys
+          content = open('$file', encoding='utf-8').read()
+          blocks = content.split('\`\`\`mermaid')
+          for i, block in enumerate(blocks[1:], 1):
+              end = block.find('\`\`\`')
+              if end == -1:
+                  print(f'::warning file=$file::mermaid block {i} is not closed')
+              elif end < 5:
+                  print(f'::warning file=$file::mermaid block {i} appears empty')
+          " 2>/dev/null || true
+          done < <(find flows/ -name "*.md" -print0 2>/dev/null || true)
+          echo "Mermaid check done."

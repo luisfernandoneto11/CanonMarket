@@ -1,0 +1,64 @@
+name: PII Guard
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  pii-check:
+    name: Check for PII leaks
+    runs-on: ubuntu-latest
+    continue-on-error: true  # warning-only, не блокирует
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Cyrillic names (2+ words)
+        id: check-names
+        run: |
+          echo "Scanning for potential full names (2+ Cyrillic words)..."
+          found=0
+          while IFS= read -r -d '' file; do
+            matches=$(grep -nP '[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+' "$file" 2>/dev/null || true)
+            if [ -n "$matches" ]; then
+              echo "::warning file=$file::Potential name found:"
+              echo "$matches" | while read -r line; do
+                echo "  $line"
+              done
+              found=1
+            fi
+          done < <(find . -name "*.md" -not -path "./.git/*" -print0)
+          if [ "$found" -eq 1 ]; then
+            echo "::warning::PII Guard: potential Cyrillic names detected. Please review before merging."
+          else
+            echo "PII check passed: no Cyrillic names found."
+          fi
+
+      - name: Check for TG handles
+        id: check-handles
+        run: |
+          echo "Scanning for TG handles (@username with 5+ chars)..."
+          found=0
+          while IFS= read -r -d '' file; do
+            matches=$(grep -nP '@[A-Za-z0-9_]{5,}' "$file" 2>/dev/null || true)
+            if [ -n "$matches" ]; then
+              echo "::warning file=$file::Potential TG handle found:"
+              echo "$matches" | while read -r line; do
+                echo "  $line"
+              done
+              found=1
+            fi
+          done < <(find . -name "*.md" -not -path "./.git/*" -print0)
+          if [ "$found" -eq 1 ]; then
+            echo "::warning::PII Guard: potential TG handles detected. Please review before merging."
+          else
+            echo "Handle check passed: no suspicious handles found."
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "PII Guard completed (warning-only mode)."
+          echo "All findings above are warnings — they do not block the build."
+          echo "Founder must review any flagged content before publishing."
