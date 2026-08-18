@@ -809,6 +809,32 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
 
+  /api/v1/cart/merge:
+    post:
+      operationId: mergeGuestCart
+      tags:
+        - Корзина
+      summary: Объединить гостевую корзину с корзиной пользователя после входа
+      description: |
+        Требует Bearer JWT и X-Session-Id гостевой корзины. Для конфликтующего SKU
+        используется MAX(guest_quantity, authenticated_quantity). X-Session-Id
+        игнорируется во всех остальных операциях при наличии валидного JWT.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XSessionId"
+      responses:
+        "200":
+          description: Гостевая корзина объединена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CartMergeResponse"
+        "400":
+          $ref: "#/components/responses/MissingCartIdentity"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /cart/validate:
     get:
       summary: Валидация корзины
@@ -1786,15 +1812,15 @@ components:
           type: string
           nullable: true
           description: |
-            Причина недоступности. `null`, если товар доступен.
-            Возможные значения: OUT_OF_STOCK, PRODUCT_BLOCKED,
-            PRODUCT_DELISTED, SKU_DISABLED.
+            Вычисляется при каждом GET из актуальных данных B2B; не хранится в корзине.
           enum:
             - OUT_OF_STOCK
             - PRODUCT_BLOCKED
+            - PRODUCT_DELETED
             - PRODUCT_DELISTED
+            - ON_MODERATION
             - SKU_DISABLED
-            - null 
+            - null
           example: null
 
     CartSummary:
@@ -1916,6 +1942,22 @@ components:
           $ref: "#/components/schemas/CartItem"
         summary:
           $ref: "#/components/schemas/CartSummary"
+
+    CartMergeResponse:
+      type: object
+      required: [merged, items]
+      properties:
+        merged:
+          type: boolean
+        items:
+          type: array
+          items:
+            type: object
+            required: [id, sku_id, quantity]
+            properties:
+              id: {type: string, format: uuid}
+              sku_id: {type: string, format: uuid}
+              quantity: {type: integer, minimum: 1}
 
     # ----- СХЕМЫ ВАЛИДАЦИИ КОРЗИНЫ -----          
     CartValidationResponse:

@@ -9,6 +9,7 @@ from app.main import BlockingReason, FieldReport, app, store
 client = TestClient(app)
 SELLER_ID = "c3d4e5f6-a7b8-9012-cdef-123456789012"
 OTHER_SELLER_ID = "d4e5f6a7-b8c9-0123-def4-234567890123"
+USER_ID = "e5f6a7b8-c9d0-1234-ef56-345678901234"
 CATEGORY_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 
 
@@ -60,6 +61,7 @@ def setup_function():
     store.unreserve_operations.clear()
     store.b2c_events.clear()
     store.processed_moderation_events.clear()
+    store.cart_items.clear()
 
 
 def test_create_product_returns_201_with_created_status():
@@ -610,3 +612,86 @@ def test_moderation_event_missing_service_key_returns_401():
         json=moderation_payload(product_id, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
     )
     assert response.status_code == 401
+
+
+def cart_jwt(user_id: str = USER_ID) -> str:
+    def part(value: dict) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{part({'alg': 'none', 'typ': 'JWT'})}.{part({'sub': user_id})}.signature"
+
+
+def make_cart_sku(active_quantity: int = 10) -> str:
+    product_id = create_product()
+    response = client.post(
+        "/api/v1/skus", json=sku_payload(product_id), headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 201
+    store.products[product_id].status = "MODERATED"
+    store.products[product_id].blocked = False
+    store.products[product_id].skus[0].active_quantity = active_quantity
+    return response.json()["id"]
+
+
+def test_add_sku_increments_quantity_if_already_in_cart():
+    sku_id = make_cart_sku()
+    session = "11111111-1111-4111-8111-111111111111"
+    headers = {"X-Session-Id": session}
+
+    first = client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 2}, headers=headers)
+    second = client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 3}, headers=headers)
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json()["quantity"] == 5
+
+
+def test_get_cart_enriched_with_b2b_data():
+    sku_id = make_cart_sku()
+    headers = {"X-Session-Id": "22222222-2222-4222-8222-222222222222"}
+    added = client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 2}, headers=headers)
+
+    response = client.get("/api/v1/cart", headers=headers)
+
+    assert added.status_code == 201
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"][0]["available"] is True
+    assert body["items"][0]["unit_price"] == 12999000
+    assert body["items"][0]["line_total"] == 25998000
+    assert body["summary"]["total_amount"] == 25998000
+    assert body["summary"]["checkout_ready"] is True
+
+
+def test_unavailable_sku_shown_with_reason():
+    sku_id = make_cart_sku(active_quantity=2)
+    headers = {"X-Session-Id": "33333333-3333-4333-8333-333333333333"}
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 1}, headers=headers).status_code == 201
+    product, sku = store._find_sku(sku_id)
+    sku.active_quantity = 0
+
+    response = client.get("/api/v1/cart", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["available"] is False
+    assert response.json()["items"][0]["unavailable_reason"] == "OUT_OF_STOCK"
+    assert response.json()["items"][0]["line_total"] == 0
+    assert response.json()["summary"]["total_amount"] == 0
+    assert response.json()["summary"]["unavailable_count"] == 1
+
+
+def test_guest_cart_merged_on_login():
+    sku_id = make_cart_sku()
+    session = "44444444-4444-4444-8444-444444444444"
+    guest_headers = {"X-Session-Id": session}
+    auth_headers = {"Authorization": f"Bearer {cart_jwt()}"}
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 3}, headers=guest_headers).status_code == 201
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 5}, headers=auth_headers).status_code == 201
+
+    response = client.post("/api/v1/cart/merge", headers={**auth_headers, "X-Session-Id": session})
+
+    assert response.status_code == 200
+    assert response.json()["merged"] is True
+    assert response.json()["items"][0]["quantity"] == 5
+    assert client.get("/api/v1/cart", headers=guest_headers).json()["items"] == []
