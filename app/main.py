@@ -15,6 +15,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi import Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -294,6 +295,69 @@ class DeleteResponse(BaseModel):
     deleted: bool
 
 
+class CartAddRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    sku_id: str
+    quantity: int = Field(ge=1)
+
+    @field_validator("sku_id")
+    @classmethod
+    def sku_id_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("sku_id must be a valid UUID") from None
+        return value
+
+
+class CartQuantityRequest(BaseModel):
+    quantity: int = Field(ge=1)
+
+
+class CartStoredItem(BaseModel):
+    id: str
+    sku_id: str
+    quantity: int
+
+
+class CartItemResponse(BaseModel):
+    item_id: str
+    sku_id: str
+    quantity: int
+    available: bool
+    unavailable_reason: str | None = None
+    available_stock: int
+    unit_price: int
+    line_total: int
+    product_id: str | None = None
+    product_title: str | None = None
+    sku_name: str | None = None
+    image_url: str | None = None
+
+
+class CartSummary(BaseModel):
+    total_amount: int
+    total_items: int
+    unavailable_count: int
+    total_quantity: int = 0
+    available_items: int = 0
+    has_unavailable_items: bool = False
+    checkout_ready: bool
+    currency: str = "RUB"
+
+
+class CartResponse(BaseModel):
+    items: list[CartItemResponse]
+    summary: CartSummary
+    checkout_payload: dict[str, Any]
+
+
+class CartMergeResponse(BaseModel):
+    merged: bool
+    items: list[CartStoredItem]
+
+
 class ModerationEvent(BaseModel):
     idempotency_key: str
     product_id: str
@@ -338,6 +402,104 @@ class ProductStore:
     unreserve_operations: dict[str, UnreserveResponse] = field(default_factory=dict)
     b2c_events: list[dict[str, Any]] = field(default_factory=list)
     processed_moderation_events: set[str] = field(default_factory=set)
+    cart_items: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def _find_sku(self, sku_id: str) -> tuple[ProductResponse | None, SkuResponse | None]:
+        for product in self.products.values():
+            for sku in product.skus:
+                if sku.id == sku_id:
+                    return product, sku
+        return None, None
+
+    def add_cart_item(self, owner_type: str, owner_id: str, payload: CartAddRequest) -> tuple[dict[str, Any], bool]:
+        product, sku = self._find_sku(payload.sku_id)
+        if product is None or sku is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="SKU not found").model_dump())
+        if product.status != "MODERATED" or product.deleted or product.blocked:
+            raise HTTPException(status_code=409, detail=ApiError(code="SKU_UNAVAILABLE", message="SKU is unavailable").model_dump())
+        if sku.active_quantity < payload.quantity:
+            raise HTTPException(status_code=409, detail=ApiError(code="OUT_OF_STOCK", message="Insufficient stock").model_dump())
+        existing = next((item for item in self.cart_items.values() if item["owner_type"] == owner_type and item["owner_id"] == owner_id and item["sku_id"] == payload.sku_id), None)
+        if existing:
+            existing["quantity"] += payload.quantity
+            return existing, False
+        item = {"id": str(uuid.uuid4()), "owner_type": owner_type, "owner_id": owner_id, "sku_id": payload.sku_id, "quantity": payload.quantity}
+        self.cart_items[item["id"]] = item
+        return item, True
+
+    def owned_cart_item(self, owner_type: str, owner_id: str, item_id: str) -> dict[str, Any]:
+        item = self.cart_items.get(item_id)
+        if item is None or item["owner_type"] != owner_type or item["owner_id"] != owner_id:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Cart item not found").model_dump())
+        return item
+
+    def list_cart(self, owner_type: str, owner_id: str) -> list[dict[str, Any]]:
+        return [item for item in self.cart_items.values() if item["owner_type"] == owner_type and item["owner_id"] == owner_id]
+
+    def enrich_cart(self, owner_type: str, owner_id: str) -> CartResponse:
+        enriched: list[CartItemResponse] = []
+        total_amount = 0
+        total_items = 0
+        unavailable_count = 0
+        checkout_items: list[dict[str, Any]] = []
+        for item in self.list_cart(owner_type, owner_id):
+            product, sku = self._find_sku(item["sku_id"])
+            reason: str | None = None
+            available = True
+            product_id = product.id if product else None
+            product_title = product.title if product else None
+            image = sku.image if sku else None
+            unit_price = sku.price if sku else 0
+            available_stock = sku.active_quantity if sku else 0
+            if product is None or sku is None:
+                available = False
+                reason = "PRODUCT_DELETED"
+            elif product.deleted or product.status == "DELETED":
+                available = False
+                reason = "PRODUCT_DELETED"
+            elif product.status in {"BLOCKED", "HARD_BLOCKED"} or product.blocked:
+                available = False
+                reason = "PRODUCT_BLOCKED"
+            elif product.status == "ON_MODERATION":
+                available = False
+                reason = "ON_MODERATION"
+            elif sku.active_quantity == 0:
+                available = False
+                reason = "OUT_OF_STOCK"
+            line_total = unit_price * item["quantity"] if available else 0
+            if not available:
+                unavailable_count += 1
+            else:
+                total_amount += line_total
+                if sku.active_quantity < item["quantity"]:
+                    checkout_items.append({"sku_id": item["sku_id"], "quantity": item["quantity"]})
+                else:
+                    total_items += item["quantity"]
+                    checkout_items.append({"sku_id": item["sku_id"], "quantity": item["quantity"]})
+            enriched.append(CartItemResponse(item_id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"], available=available, unavailable_reason=reason, available_stock=available_stock, unit_price=unit_price, line_total=line_total, product_id=product_id, product_title=product_title, sku_name=sku.name if sku else None, image_url=image))
+        checkout_ready = unavailable_count == 0 and all(item.available_stock >= item.quantity for item in enriched)
+        available_items = sum(1 for item in enriched if item.available)
+        total_quantity = sum(item.quantity for item in enriched)
+        return CartResponse(
+            items=enriched,
+            summary=CartSummary(total_amount=total_amount, total_items=len(enriched), unavailable_count=unavailable_count, total_quantity=total_quantity, available_items=available_items, has_unavailable_items=unavailable_count > 0, checkout_ready=checkout_ready),
+            checkout_payload={"items": checkout_items, "total_amount": total_amount, "currency": "RUB"} if checkout_ready else {"items": [], "total_amount": 0, "currency": "RUB"},
+        )
+
+    def merge_guest_cart(self, session_id: str, user_id: str) -> CartMergeResponse:
+        guest_items = [item for item in self.cart_items.values() if item["owner_type"] == "session" and item["owner_id"] == session_id]
+        auth_items = {(item["sku_id"]): item for item in self.list_cart("user", user_id)}
+        for guest in guest_items:
+            existing = auth_items.get(guest["sku_id"])
+            if existing:
+                existing["quantity"] = max(existing["quantity"], guest["quantity"])
+                self.cart_items.pop(guest["id"], None)
+            else:
+                guest["owner_type"] = "user"
+                guest["owner_id"] = user_id
+                auth_items[guest["sku_id"]] = guest
+        items = [CartStoredItem(id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"]) for item in self.list_cart("user", user_id)]
+        return CartMergeResponse(merged=True, items=items)
 
     def apply_moderation(self, payload: ModerationDecisionRequest) -> ModerationDecisionResponse:
         if payload.idempotency_key in self.processed_moderation_events:
@@ -783,6 +945,103 @@ def unreserve_skus(
             detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump(),
         )
     return store.unreserve(payload)
+
+
+def get_cart_identity(
+    authorization: Annotated[str | None, Header()] = None,
+    x_session_id: Annotated[str | None, Header()] = None,
+) -> tuple[str, str]:
+    if authorization:
+        if not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Bearer token is required").model_dump())
+        try:
+            claims = _decode_jwt_payload(authorization[7:].strip())
+            user_id = claims.get("sub") or claims.get("user_id")
+            uuid.UUID(str(user_id))
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+            raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="user_id claim is required").model_dump()) from None
+        return "user", str(user_id)
+    if not x_session_id:
+        raise HTTPException(status_code=400, detail=ApiError(code="MISSING_CART_IDENTITY", message="JWT or X-Session-Id is required").model_dump())
+    try:
+        uuid.UUID(x_session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="X-Session-Id must be a valid UUID").model_dump()) from None
+    return "session", x_session_id
+
+
+@app.post(
+    "/api/v1/cart/items",
+    response_model=CartStoredItem,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 409: {"model": ApiError}},
+)
+def add_cart_item(payload: CartAddRequest, response: Response, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartStoredItem:
+    owner_type, owner_id = identity
+    item, created = store.add_cart_item(owner_type, owner_id, payload)
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    return CartStoredItem(id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"])
+
+
+@app.get(
+    "/api/v1/cart",
+    response_model=CartResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def get_cart(identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartResponse:
+    return store.enrich_cart(*identity)
+
+
+@app.put(
+    "/api/v1/cart/items/{item_id}",
+    response_model=CartStoredItem,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}},
+)
+def update_cart_item(item_id: str, payload: CartQuantityRequest, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartStoredItem:
+    item = store.owned_cart_item(*identity, item_id)
+    product, sku = store._find_sku(item["sku_id"])
+    if product is None or sku is None or sku.active_quantity < payload.quantity:
+        raise HTTPException(status_code=409, detail=ApiError(code="OUT_OF_STOCK", message="Insufficient stock").model_dump())
+    item["quantity"] = payload.quantity
+    return CartStoredItem(id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"])
+
+
+@app.delete(
+    "/api/v1/cart/items/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def delete_cart_item(item_id: str, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> Response:
+    item = store.owned_cart_item(*identity, item_id)
+    store.cart_items.pop(item["id"], None)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.delete(
+    "/api/v1/cart",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}},
+)
+def clear_cart(identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> Response:
+    for item in store.list_cart(*identity):
+        store.cart_items.pop(item["id"], None)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(
+    "/api/v1/cart/merge",
+    response_model=CartMergeResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}},
+)
+def merge_guest_cart(
+    authorization: Annotated[str | None, Header()] = None,
+    x_session_id: Annotated[str | None, Header()] = None,
+) -> CartMergeResponse:
+    if not x_session_id:
+        raise HTTPException(status_code=400, detail=ApiError(code="MISSING_CART_IDENTITY", message="X-Session-Id is required for merge").model_dump())
+    identity = get_cart_identity(authorization=authorization, x_session_id=None)
+    if identity[0] != "user":
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Bearer token is required for merge").model_dump())
+    return store.merge_guest_cart(x_session_id, identity[1])
 
 
 def _valid_moderation_service_key(value: str | None) -> bool:
