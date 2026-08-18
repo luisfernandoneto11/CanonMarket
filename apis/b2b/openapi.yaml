@@ -259,6 +259,75 @@ components:
           type: integer
         offset:
           type: integer
+    ReserveItem:
+      type: object
+      required: [sku_id, quantity]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+    ReserveRequest:
+      type: object
+      required: [idempotency_key, items]
+      properties:
+        idempotency_key:
+          type: string
+          format: uuid
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ReserveItem"
+    ReserveResponse:
+      type: object
+      required: [reserved, items, failed_items]
+      properties:
+        reserved:
+          type: boolean
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku_id, reserved_quantity, remaining_stock]
+            properties:
+              sku_id:
+                type: string
+                format: uuid
+              reserved_quantity:
+                type: integer
+              remaining_stock:
+                type: integer
+        failed_items:
+          type: array
+          items:
+            type: object
+            required: [sku_id, requested, available, reason]
+            properties:
+              sku_id:
+                type: string
+                format: uuid
+              requested:
+                type: integer
+              available:
+                type: integer
+              reason:
+                type: string
+                enum: [OUT_OF_STOCK, INSUFFICIENT_STOCK]
+    UnreserveRequest:
+      type: object
+      required: [order_id, items]
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ReserveItem"
 
 
 
@@ -346,6 +415,62 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiError"
+
+  /api/v1/reserve:
+    post:
+      summary: Reserve SKU quantities atomically
+      tags: [Inventory]
+      security:
+        - serviceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReserveRequest"
+      responses:
+        "200":
+          description: All requested quantities reserved or an idempotent cached success returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReserveResponse"
+        "401":
+          description: X-Service-Key ausente ou inválido
+        "409":
+          description: Insufficient stock; no SKU was changed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReserveResponse"
+
+  /api/v1/unreserve:
+    post:
+      summary: Release a previous reservation
+      tags: [Inventory]
+      security:
+        - serviceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UnreserveRequest"
+      responses:
+        "200":
+          description: Reservation released
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+        "401":
+          description: X-Service-Key ausente ou inválido
+        "409":
+          description: Reserved quantity is insufficient
 
   /api/v1/products/{id}:
     get:
