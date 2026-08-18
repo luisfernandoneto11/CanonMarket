@@ -1,4 +1,4 @@
-"""NeoMarket B2B API: product creation flow."""
+"""NeoMarket B2B API: product and SKU creation flows."""
 
 from __future__ import annotations
 
@@ -8,16 +8,18 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, field
-from typing import Annotated, Any
+from datetime import datetime, timezone
+from typing import Annotated, Any, Callable
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 app = FastAPI(title="NeoMarket B2B", version="1.0.0")
 
-# The canon currently publishes this category in the create-product example.
-# Deployments can add comma-separated UUIDs through VALID_CATEGORY_IDS.
 _CANON_CATEGORY_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 VALID_CATEGORY_IDS = {
     _CANON_CATEGORY_ID,
@@ -46,7 +48,7 @@ class Characteristic(BaseModel):
 
 
 class CreateProductRequest(BaseModel):
-    # Unknown fields are ignored so a body-provided seller_id cannot override JWT ownership.
+    # Ignore an untrusted body seller_id; ownership always comes from JWT.
     model_config = ConfigDict(extra="ignore")
 
     title: str = Field(min_length=1, max_length=255)
@@ -65,9 +67,64 @@ class CreateProductRequest(BaseModel):
         return value
 
 
+class CreateSkuRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str
+    name: str = Field(min_length=1, max_length=255)
+    price: int
+    cost_price: int
+    discount: int = 0
+    image: str = Field(min_length=1)
+    characteristics: list[Characteristic] = Field(default_factory=list)
+
+    @field_validator("product_id")
+    @classmethod
+    def product_id_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("product_id must be a valid UUID") from None
+        return value
+
+    @field_validator("price")
+    @classmethod
+    def price_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("price must be a positive integer (kopecks)")
+        return value
+
+    @field_validator("cost_price")
+    @classmethod
+    def cost_price_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("cost_price must be a positive integer (kopecks)")
+        return value
+
+    @field_validator("discount")
+    @classmethod
+    def discount_must_not_be_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("discount must be a non-negative integer (kopecks)")
+        return value
+
+
 class CategoryRef(BaseModel):
     id: str
     name: str
+
+
+class SkuResponse(BaseModel):
+    id: str
+    product_id: str
+    name: str
+    price: int
+    cost_price: int
+    discount: int
+    image: str
+    active_quantity: int = 0
+    reserved_quantity: int = 0
+    characteristics: list[Characteristic]
 
 
 class ProductResponse(BaseModel):
@@ -81,12 +138,49 @@ class ProductResponse(BaseModel):
     category: CategoryRef
     images: list[Image]
     characteristics: list[Characteristic]
-    skus: list[Any]
+    skus: list[SkuResponse]
+
+
+class ModerationEvent(BaseModel):
+    idempotency_key: str
+    product_id: str
+    seller_id: str
+    event: str
+    date: str
+
+
+class ModerationPublisher:
+    """Publishes synchronously when MODERATION_URL is configured and always records events."""
+
+    def __init__(self, url: str | None = None, service_key: str | None = None):
+        self.url = url or os.getenv("MODERATION_URL")
+        self.service_key = service_key or os.getenv("B2B_TO_MOD_KEY", "development-service-key")
+        self.events: list[ModerationEvent] = []
+
+    def publish_created(self, product: ProductResponse) -> ModerationEvent:
+        event = ModerationEvent(
+            idempotency_key=str(uuid.uuid4()),
+            product_id=product.id,
+            seller_id=product.seller_id,
+            event="CREATED",
+            date=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        self.events.append(event)
+        if self.url:
+            response = httpx.post(
+                f"{self.url.rstrip('/')}/api/v1/events/product",
+                headers={"X-Service-Key": self.service_key},
+                json=event.model_dump(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+        return event
 
 
 @dataclass
 class ProductStore:
     products: dict[str, ProductResponse] = field(default_factory=dict)
+    moderation: ModerationPublisher = field(default_factory=ModerationPublisher)
 
     def create(self, payload: CreateProductRequest, seller_id: str) -> ProductResponse:
         product_id = str(uuid.uuid4())
@@ -108,6 +202,39 @@ class ProductStore:
         )
         self.products[product_id] = product
         return product
+
+    def add_sku(self, payload: CreateSkuRequest) -> tuple[SkuResponse, bool]:
+        product = self.products.get(payload.product_id)
+        if product is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
+            )
+        if product.status == "HARD_BLOCKED" or product.blocked:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=ApiError(
+                    code="FORBIDDEN",
+                    message="Cannot add SKU to hard-blocked product",
+                ).model_dump(),
+            )
+
+        sku = SkuResponse(
+            id=str(uuid.uuid4()),
+            product_id=product.id,
+            name=payload.name,
+            price=payload.price,
+            cost_price=payload.cost_price,
+            discount=payload.discount,
+            image=payload.image,
+            characteristics=payload.characteristics,
+        )
+        is_first_sku = len(product.skus) == 0
+        product.skus.append(sku)
+        if is_first_sku and product.status == "CREATED":
+            product.status = "ON_MODERATION"
+            self.moderation.publish_created(product)
+        return sku, is_first_sku
 
 
 store = ProductStore()
@@ -143,29 +270,37 @@ def get_seller_id(authorization: Annotated[str | None, Header()] = None) -> str:
     return str(seller_id)
 
 
-def validation_error_response(exc: Exception) -> HTTPException:
-    message = str(exc)
-    if "category_id must be a valid UUID" in message:
-        message = "category_id must be a valid UUID"
-    elif "images" in message:
-        message = "At least one image is required"
-    elif "title" in message:
-        message = "title must be 1-255 characters"
-    return HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=ApiError(code="INVALID_REQUEST", message=message).model_dump(),
-    )
-
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
-    # Keep the public error contract stable while preserving FastAPI's status codes.
-    from fastapi.responses import JSONResponse
-
     detail = exc.detail
     if isinstance(detail, dict) and "code" in detail and "message" in detail:
         return JSONResponse(status_code=exc.status_code, content=detail)
     return JSONResponse(status_code=exc.status_code, content=detail)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request, exc: RequestValidationError):
+    errors = exc.errors()
+    if not errors:
+        message = "Invalid request"
+    else:
+        error = errors[0]
+        field = str(error.get("loc", ["request"])[-1])
+        raw_message = str(error.get("msg", "is required")).replace("Value error, ", "")
+        canonical = {
+            "images": "At least one image is required",
+            "image": "image is required",
+            "name": "name is required",
+            "price": "price must be a positive integer (kopecks)",
+            "cost_price": "cost_price must be a positive integer (kopecks)",
+            "product_id": "product_id must be a valid UUID",
+            "category_id": "category_id must be a valid UUID",
+        }
+        message = canonical.get(field, raw_message)
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=ApiError(code="INVALID_REQUEST", message=message).model_dump(),
+    )
 
 
 @app.post(
@@ -186,28 +321,26 @@ def create_product(
     return store.create(payload, seller_id)
 
 
+@app.post(
+    "/api/v1/skus",
+    response_model=SkuResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def create_sku(
+    payload: CreateSkuRequest,
+    seller_id: Annotated[str, Depends(get_seller_id)],
+) -> SkuResponse:
+    product = store.products.get(payload.product_id)
+    if product is not None and product.seller_id != seller_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ApiError(code="NOT_OWNER", message="Product does not belong to the authenticated seller").model_dump(),
+        )
+    sku, _ = store.add_sku(payload)
+    return sku
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-# Pydantic validation errors are normalized to the canon's error envelope.
-from fastapi.exceptions import RequestValidationError
-
-
-@app.exception_handler(RequestValidationError)
-async def request_validation_exception_handler(request, exc: RequestValidationError):
-    from fastapi.responses import JSONResponse
-
-    errors = exc.errors()
-    field = str(errors[0].get("loc", ["request"])[-1]) if errors else "request"
-    message_map = {
-        "images": "At least one image is required",
-        "category_id": "category_id must be a valid UUID",
-        "title": "title must be 1-255 characters",
-    }
-    message = message_map.get(field, f"{field} is required")
-    return JSONResponse(
-        status_code=400,
-        content=ApiError(code="INVALID_REQUEST", message=message).model_dump(),
-    )

@@ -47,6 +47,68 @@ components:
           type: array
           items:
             $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+    CreateSkuRequest:
+      type: object
+      required: [product_id, name, price, cost_price, image]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        price:
+          type: integer
+          minimum: 1
+          description: Цена продажи в копейках
+        cost_price:
+          type: integer
+          minimum: 1
+          description: Себестоимость в копейках
+        discount:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Абсолютная скидка в копейках
+        image:
+          type: string
+          minLength: 1
+          format: uri-reference
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+    SkuResponse:
+      type: object
+      required: [id, product_id, name, price, cost_price, discount, image, active_quantity, reserved_quantity, characteristics]
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        price:
+          type: integer
+        cost_price:
+          type: integer
+        discount:
+          type: integer
+        image:
+          type: string
+        active_quantity:
+          type: integer
+          default: 0
+        reserved_quantity:
+          type: integer
+          default: 0
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
 
 paths:
   /api/v1/products:
@@ -152,15 +214,39 @@ paths:
     post:
       summary: Создать SKU
       tags: [SKU]
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
+              $ref: "#/components/schemas/CreateSkuRequest"
       responses:
         "201":
-          description: SKU создан
+          description: SKU создан; первый SKU переводит товар CREATED в ON_MODERATION и публикует событие CREATED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkuResponse"
+        "400":
+          description: Некорректные данные SKU
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "403":
+          description: Товар заблокирован или не принадлежит продавцу
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Товар не найден
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 
     put:
       summary: Изменить SKU
