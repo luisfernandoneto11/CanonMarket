@@ -186,9 +186,133 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FieldReport"
+    PublicSkuResponse:
+      type: object
+      required: [id, product_id, name, price, discount, image, active_quantity, characteristics]
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        price:
+          type: integer
+        discount:
+          type: integer
+        image:
+          type: string
+        active_quantity:
+          type: integer
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+    CatalogProduct:
+      type: object
+      required: [id, title, description, status, category, images, characteristics, skus]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [MODERATED]
+        category:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+        images:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/Image"
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+        skus:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicSkuResponse"
+    CatalogResponse:
+      type: object
+      required: [items, total_count, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogProduct"
+        total_count:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
 
 paths:
   /api/v1/products:
+    get:
+      summary: Catálogo B2C de produtos visíveis
+      tags: [Catalog]
+      security:
+        - serviceKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: category
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [price_asc, price_desc, date_desc]
+            default: date_desc
+        - name: ids
+          in: query
+          description: Lista de UUIDs separada por vírgulas; IDs invisíveis são omitidos.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Produtos MODERATED, não deletados e com estoque ativo
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogResponse"
+        "401":
+          description: X-Service-Key ausente ou inválido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
     post:
       summary: Создать товар
       tags: [Products]

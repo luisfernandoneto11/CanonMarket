@@ -309,3 +309,77 @@ def test_get_nonexistent_returns_404():
 
     assert response.status_code == 404
     assert response.json() == {"code": "NOT_FOUND", "message": "Product not found"}
+
+
+def make_moderated_product(active_quantity: int = 5, title: str = "Visible phone") -> str:
+    product_id = create_product()
+    product = store.products[product_id]
+    product.title = title
+    product.status = "MODERATED"
+    sku_result = client.post(
+        "/api/v1/skus", json=sku_payload(product_id), headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert sku_result.status_code == 201
+    product.status = "MODERATED"
+    product.skus[0].active_quantity = active_quantity
+    return product_id
+
+
+def test_catalog_returns_moderated_in_stock_products():
+    visible_id = make_moderated_product(active_quantity=5)
+    make_moderated_product(active_quantity=0, title="Out of stock")
+    create_product(status="BLOCKED")
+
+    response = client.get("/api/v1/products", headers={"X-Service-Key": "development-service-key"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_count"] == 1
+    assert body["items"][0]["id"] == visible_id
+    assert body["items"][0]["status"] == "MODERATED"
+
+
+def test_catalog_excludes_hard_blocked():
+    product_id = make_moderated_product(active_quantity=5)
+    store.products[product_id].status = "HARD_BLOCKED"
+
+    response = client.get("/api/v1/products", headers={"X-Service-Key": "development-service-key"})
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
+def test_catalog_missing_service_key_returns_401():
+    response = client.get("/api/v1/products")
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "code": "UNAUTHORIZED",
+        "message": "Valid X-Service-Key is required",
+    }
+
+
+def test_catalog_response_has_no_cost_price():
+    make_moderated_product(active_quantity=5)
+
+    response = client.get("/api/v1/products", headers={"X-Service-Key": "development-service-key"})
+
+    assert response.status_code == 200
+    sku = response.json()["items"][0]["skus"][0]
+    assert "cost_price" not in sku
+    assert "reserved_quantity" not in sku
+
+
+def test_batch_ids_returns_visible_subset():
+    visible_id = make_moderated_product(active_quantity=5)
+    hidden_id = make_moderated_product(active_quantity=0, title="Hidden phone")
+    blocked_id = create_product(status="HARD_BLOCKED")
+    ids = f"{visible_id},{hidden_id},{blocked_id},a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    response = client.get(
+        f"/api/v1/products?ids={ids}",
+        headers={"X-Service-Key": "development-service-key"},
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [visible_id]
