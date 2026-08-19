@@ -699,6 +699,7 @@ def test_guest_cart_merged_on_login():
     assert client.get("/api/v1/cart", headers=guest_headers).json()["items"] == []
 
 
+
 # Task 8 — catalog filters and facets
 
 def test_catalog_filters_by_characteristic_and_sort():
@@ -813,6 +814,7 @@ def test_category_filters_include_dynamic_characteristics():
     assert any(item["name"] == "Brand" for item in response.json()["items"])
 
 
+
 # Task 9 — B2C product card
 
 def test_product_card_returns_full_data_with_skus():
@@ -862,6 +864,7 @@ def test_b2c_card_does_not_expose_seller_or_moderation_fields():
     assert "deleted" not in body
     assert "blocking_reason" not in body
     assert "field_reports" not in body
+
 
 
 def test_checkout_creates_paid_order_with_fixed_prices():
