@@ -61,6 +61,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      summary: Cancel a buyer-owned order
+      operationId: cancelOrder
+      security:
+        - bearerHttpAuthentication: []
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancellation accepted. Status is CANCELLED when unreserve succeeds or CANCEL_PENDING when retry is required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: Order does not exist or belongs to another user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '409':
+          description: Cancellation is not allowed for the current order status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelNotAllowedError'
 components:
   securitySchemes:
     bearerHttpAuthentication:
@@ -127,7 +170,7 @@ components:
           format: uuid
         status:
           type: string
-          enum: [PAID]
+          enum: [CREATED, PAID, ASSEMBLING, DELIVERING, DELIVERED, CANCELLED, CANCEL_PENDING]
         total_amount:
           type: integer
         idempotency_key:
@@ -167,6 +210,18 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/FailedItem'
+    CancelNotAllowedError:
+      type: object
+      required: [code, message, current_status]
+      properties:
+        code:
+          type: string
+          enum: [CANCEL_NOT_ALLOWED]
+        message:
+          type: string
+        current_status:
+          type: string
+          enum: [CREATED, PAID, ASSEMBLING, DELIVERING, DELIVERED, CANCELLED, CANCEL_PENDING]
     ApiError:
       type: object
       required: [code, message]

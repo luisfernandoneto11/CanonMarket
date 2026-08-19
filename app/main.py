@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 app = FastAPI(title="NeoMarket B2B", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 _CANON_CATEGORY_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 VALID_CATEGORY_IDS = {
@@ -507,6 +509,7 @@ class ProductStore:
     cart_items: dict[str, dict[str, Any]] = field(default_factory=dict)
     orders: dict[str, OrderResponse] = field(default_factory=dict)
     orders_by_idempotency: dict[str, str] = field(default_factory=dict)
+    cancellation_errors: list[dict[str, str]] = field(default_factory=list)
 
     def _find_sku(self, sku_id: str) -> tuple[ProductResponse | None, SkuResponse | None]:
         for product in self.products.values():
@@ -768,6 +771,63 @@ class ProductStore:
         self.orders[order.id] = order
         self.orders_by_idempotency[payload.idempotency_key] = order.id
         return order, True
+
+    def cancel_order(self, order_id: str, user_id: str) -> OrderResponse:
+        order = self.orders.get(order_id)
+        if order is None or order.user_id != user_id:
+            raise HTTPException(status_code=404, detail=ApiError(code="ORDER_NOT_FOUND", message="Order not found").model_dump())
+        if order.status not in {"CREATED", "PAID"}:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CANCEL_NOT_ALLOWED",
+                    "message": f"Cancellation is not allowed for order status {order.status}",
+                    "current_status": order.status,
+                },
+            )
+
+        if os.getenv("B2B_UNRESERVE_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+            order.status = "CANCEL_PENDING"
+            self.cancellation_errors.append({"order_id": order.id, "reason": "B2B_UNAVAILABLE"})
+            logger.warning("unreserve unavailable for cancellation of order %s; marked CANCEL_PENDING", order.id)
+            return order
+
+        try:
+            self.unreserve(
+                UnreserveRequest(
+                    order_id=order.id,
+                    items=[ReserveItem(sku_id=item.sku_id, quantity=item.quantity) for item in order.items],
+                )
+            )
+        except (HTTPException, TimeoutError, ConnectionError) as exc:
+            order.status = "CANCEL_PENDING"
+            self.cancellation_errors.append({"order_id": order.id, "reason": str(exc)})
+            logger.warning("unreserve failed for cancellation of order %s; marked CANCEL_PENDING", order.id)
+            return order
+
+        order.status = "CANCELLED"
+        return order
+
+    def retry_pending_cancellations(self) -> int:
+        """Scaffold retry hook for cron/Celery; returns the number successfully cancelled."""
+        completed = 0
+        if os.getenv("B2B_UNRESERVE_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+            return completed
+        for order in list(self.orders.values()):
+            if order.status != "CANCEL_PENDING":
+                continue
+            try:
+                self.unreserve(
+                    UnreserveRequest(
+                        order_id=order.id,
+                        items=[ReserveItem(sku_id=item.sku_id, quantity=item.quantity) for item in order.items],
+                    )
+                )
+            except (HTTPException, TimeoutError, ConnectionError):
+                continue
+            order.status = "CANCELLED"
+            completed += 1
+        return completed
 
     def unreserve(self, payload: UnreserveRequest) -> UnreserveResponse:
         cached = self.unreserve_operations.get(payload.order_id)
@@ -1287,6 +1347,23 @@ def create_order(
         raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Product service temporarily unavailable").model_dump())
     order, _ = store.create_order(user_id, payload)
     return order
+
+
+@app.post(
+    "/api/v1/orders/{order_id}/cancel",
+    response_model=OrderResponse,
+    responses={401: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}},
+)
+def cancel_order(
+    order_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> OrderResponse:
+    try:
+        uuid.UUID(order_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=ApiError(code="ORDER_NOT_FOUND", message="Order not found").model_dump()) from None
+    user_id = get_checkout_user_id(authorization)
+    return store.cancel_order(order_id, user_id)
 
 
 @app.post(
