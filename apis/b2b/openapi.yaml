@@ -386,8 +386,25 @@ paths:
           in: query
           schema:
             type: string
+
+            enum: [rating, popularity, price_asc, price_desc, date_desc, discount_desc]
+            default: rating
+        - name: filters[Brand]
+          in: query
+          style: deepObject
+          explode: true
+          description: Dynamic characteristic filter, for example filters[Brand]=Apple.
+          schema:
+            type: string
+        - name: category_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+
             enum: [price_asc, price_desc, date_desc]
             default: date_desc
+
         - name: ids
           in: query
           description: Lista de UUIDs separada por vírgulas; IDs invisíveis são omitidos.
@@ -436,6 +453,122 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiError"
+
+
+  /api/v1/catalog/facets:
+    get:
+      summary: Return visible catalog characteristic facets
+      tags: [Catalog]
+      security:
+        - serviceKeyAuth: []
+      parameters:
+        - name: category_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: filters[Brand]
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Facet groups computed from visible B2C products
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [category_id, facets]
+                properties:
+                  category_id:
+                    type: string
+                    format: uuid
+                    nullable: true
+                  facets:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, values]
+                      properties:
+                        name:
+                          type: string
+                        values:
+                          type: array
+                          items:
+                            type: object
+                            required: [value, count]
+                            properties:
+                              value:
+                                type: string
+                              count:
+                                type: integer
+        "401":
+          description: X-Service-Key ausente ou inválido
+        "502":
+          description: B2B catalog unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /api/v1/categories/{category_id}/filters:
+    get:
+      summary: Return characteristic filters available for a category
+      tags: [Catalog]
+      security:
+        - serviceKeyAuth: []
+      parameters:
+        - name: category_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: filters[Brand]
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Filter definitions and visible values for the category
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [slug, name, type, value]
+                      properties:
+                        slug:
+                          type: string
+                        name:
+                          type: string
+                        type:
+                          type: string
+                        value:
+                          nullable: true
+                          oneOf:
+                            - type: string
+                            - type: array
+                              items:
+                                type: string
+        "401":
+          description: X-Service-Key ausente ou inválido
+        "502":
+          description: B2B catalog unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
 
   /api/v1/reserve:
     post:
