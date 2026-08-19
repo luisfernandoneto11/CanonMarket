@@ -1,5 +1,6 @@
 import base64
 import json
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -64,6 +65,7 @@ def setup_function():
     store.cart_items.clear()
     store.orders.clear()
     store.orders_by_idempotency.clear()
+    store.cancellation_errors.clear()
 
 
 def test_create_product_returns_201_with_created_status():
@@ -933,3 +935,67 @@ def test_b2b_unavailable_returns_503(monkeypatch):
     )
     assert response.status_code == 503
     assert response.json() == {"code": "B2B_UNAVAILABLE", "message": "Product service temporarily unavailable"}
+
+
+def _create_checkout_order_for_cancel(quantity: int = 2) -> tuple[str, str]:
+    sku_id = make_cart_sku(5)
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "idempotency_key": str(uuid.uuid4()),
+            "items": [{"sku_id": sku_id, "quantity": quantity}],
+        },
+        headers={"Authorization": f"Bearer {cart_jwt()}"},
+    )
+    assert response.status_code == 201
+    return response.json()["id"], sku_id
+
+
+def test_cancel_paid_order_transitions_to_cancelled():
+    order_id, sku_id = _create_checkout_order_for_cancel()
+    sku = next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id)
+    assert sku.active_quantity == 3
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+    assert sku.active_quantity == 5
+    assert sku.reserved_quantity == 0
+
+
+def test_unreserve_failure_transitions_to_cancel_pending(monkeypatch):
+    order_id, sku_id = _create_checkout_order_for_cancel()
+    sku = next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id)
+    monkeypatch.setenv("B2B_UNRESERVE_UNAVAILABLE", "1")
+
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCEL_PENDING"
+    assert sku.active_quantity == 3
+    assert sku.reserved_quantity == 2
+    monkeypatch.delenv("B2B_UNRESERVE_UNAVAILABLE", raising=False)
+    assert store.retry_pending_cancellations() == 1
+    assert store.orders[order_id].status == "CANCELLED"
+    assert sku.active_quantity == 5
+
+
+def test_cancel_assembling_order_returns_409():
+    order_id, _ = _create_checkout_order_for_cancel()
+    store.orders[order_id].status = "ASSEMBLING"
+
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "CANCEL_NOT_ALLOWED"
+    assert response.json()["current_status"] == "ASSEMBLING"
+
+
+def test_other_user_order_returns_404():
+    order_id, _ = _create_checkout_order_for_cancel()
+    other_user = "f6a7b8c9-d0e1-2345-f678-456789012345"
+
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt(other_user)}"})
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "ORDER_NOT_FOUND"
