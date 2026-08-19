@@ -350,6 +350,13 @@ class ModerationActionResponse(BaseModel):
     status: str
 
 
+class ModerationDeclineRequest(BaseModel):
+    blocking_reason: BlockingReason
+    moderator_comment: str | None = Field(default=None, max_length=1000)
+    field_reports: list[FieldReport] = Field(default_factory=list)
+    hard_block: bool = False
+
+
 class ProductEventRequest(BaseModel):
     product_id: str
     seller_id: str
@@ -714,6 +721,26 @@ class ProductStore:
         product.blocked = False
         product.blocking_reason = None
         product.field_reports = []
+        self.moderator_assignments.pop(product_id, None)
+        return ModerationActionResponse(product_id=product.id, status=product.status)
+
+    def hard_block_product(self, product_id: str, moderator_id: str, payload: ModerationDeclineRequest) -> ModerationActionResponse:
+        product = self.products.get(product_id)
+        if product is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump())
+        if product.status == "HARD_BLOCKED":
+            raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product is permanently blocked").model_dump())
+        if product.status != "IN_REVIEW":
+            raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product is not in review status").model_dump())
+        if self.moderator_assignments.get(product_id) != moderator_id:
+            raise HTTPException(status_code=403, detail=ApiError(code="FORBIDDEN", message="This moderation card is not assigned to you").model_dump())
+        if not payload.hard_block:
+            raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="hard_block must be true for this terminal action").model_dump())
+        self._emit_moderation_event(product, "BLOCKED", hard_block=True, blocking_reason=payload.blocking_reason)
+        product.status = "HARD_BLOCKED"
+        product.blocked = True
+        product.blocking_reason = payload.blocking_reason
+        product.field_reports = payload.field_reports
         self.moderator_assignments.pop(product_id, None)
         return ModerationActionResponse(product_id=product.id, status=product.status)
 
@@ -1573,6 +1600,25 @@ def approve_product(
     except ValueError:
         raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump()) from None
     return store.approve_product(product_id, moderator_id, payload.moderator_comment if payload else None)
+
+
+@app.post(
+    "/api/v1/products/{product_id}/decline",
+    response_model=ModerationActionResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def decline_product(
+    product_id: str,
+    moderator_id: Annotated[str, Depends(get_moderator_id)],
+    payload: ModerationDeclineRequest,
+) -> ModerationActionResponse:
+    try:
+        uuid.UUID(product_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump()) from None
+    if not payload.hard_block:
+        raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="Only hard_block=true is implemented in this task").model_dump())
+    return store.hard_block_product(product_id, moderator_id, payload)
 
 
 @app.post(

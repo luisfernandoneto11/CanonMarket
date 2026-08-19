@@ -1080,3 +1080,93 @@ def test_approve_without_sku_returns_409():
 
     assert response.status_code == 409
     assert "no SKUs" in response.json()["message"]
+
+
+def test_hard_block_transitions_to_terminal_and_emits_event():
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+    response = client.post(
+        f"/api/v1/products/{product_id}/decline",
+        json={
+            "hard_block": True,
+            "blocking_reason": {
+                "id": "b8c9d0e1-2345-6789-f012-901234567890",
+                "title": "Counterfeit product",
+                "comment": "Confirmed counterfeit",
+            },
+            "field_reports": [],
+        },
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"product_id": product_id, "status": "HARD_BLOCKED"}
+    assert store.products[product_id].status == "HARD_BLOCKED"
+    assert store.products[product_id].blocked is True
+    assert store.moderation_outgoing_events[-1]["status"] == "BLOCKED"
+
+
+def test_hard_block_event_carries_hard_block_true():
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+    client.post(
+        f"/api/v1/products/{product_id}/decline",
+        json={
+            "hard_block": True,
+            "blocking_reason": {
+                "id": "c9d0e1f2-3456-7890-0123-012345678901",
+                "title": "Prohibited product",
+                "comment": "Prohibited for sale",
+            },
+        },
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+    assert store.moderation_outgoing_events[-1]["hard_block"] is True
+    assert store.moderation_outgoing_events[-1]["blocking_reason"]["id"] == "c9d0e1f2-3456-7890-0123-012345678901"
+
+
+def test_any_modify_on_hard_blocked_returns_403():
+    product_id = create_product(status="HARD_BLOCKED")
+    update = client.put(
+        f"/api/v1/products/{product_id}",
+        json={"title": "Attempted change"},
+        headers={"Authorization": f"Bearer {jwt_for()}"},
+    )
+    delete = client.delete(
+        f"/api/v1/products/{product_id}",
+        headers={"Authorization": f"Bearer {jwt_for()}"},
+    )
+    sku = client.post(
+        "/api/v1/skus",
+        json=sku_payload(product_id),
+        headers={"Authorization": f"Bearer {jwt_for()}"},
+    )
+    assert update.status_code == 403
+    assert delete.status_code == 403
+    assert sku.status_code == 403
+
+
+def test_edited_event_on_hard_blocked_is_ignored():
+    product_id = create_product(status="HARD_BLOCKED")
+    response = client.post(
+        "/api/v1/events/product",
+        json={"product_id": product_id, "seller_id": SELLER_ID, "event": "EDITED", "date": "2026-08-19T00:00:00Z"},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 200
+    assert response.json()["ignored"] is True
+    assert store.products[product_id].status == "HARD_BLOCKED"
+
+
+def test_deleted_event_removes_hard_blocked():
+    product_id = create_product(status="HARD_BLOCKED")
+    store.products[product_id].blocked = True
+    response = client.post(
+        "/api/v1/events/product",
+        json={"product_id": product_id, "seller_id": SELLER_ID, "event": "DELETED", "date": "2026-08-19T00:01:00Z"},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 200
+    assert store.products[product_id].deleted is True
+    assert store.products[product_id].blocked is True
+    assert store.products[product_id].status == "DELETED"
