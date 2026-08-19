@@ -188,6 +188,28 @@ class CatalogProductResponse(BaseModel):
 
 
 
+class ProductCardSkuResponse(BaseModel):
+    id: str
+    name: str
+    price: int
+    discount: int
+    image: str
+    active_quantity: int
+    in_stock: bool
+    characteristics: list[Characteristic]
+
+
+class ProductCardResponse(BaseModel):
+    id: str
+    title: str
+    description: str
+    status: str
+    images: list[Image]
+    characteristics: list[Characteristic]
+    skus: list[ProductCardSkuResponse]
+
+
+
 class CatalogResponse(BaseModel):
     items: list[CatalogProductResponse]
     total_count: int
@@ -1044,7 +1066,7 @@ def create_sku(
 
 @app.get(
     "/api/v1/products/{product_id}",
-    response_model=ProductResponse,
+    response_model=ProductResponse | ProductCardResponse,
     responses={401: {"model": ApiError}, 404: {"model": ApiError}},
 )
 def get_product(
@@ -1105,6 +1127,33 @@ def get_product(
         )
 
     expected_service_key = os.getenv("B2B_TO_MOD_KEY", "development-service-key")
+    if x_service_key is None and authorization is None:
+        if product.status != "MODERATED" or product.deleted or not product.skus:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
+            )
+        return ProductCardResponse(
+            id=product.id,
+            title=product.title,
+            description=product.description,
+            status=product.status,
+            images=product.images,
+            characteristics=product.characteristics,
+            skus=[
+                ProductCardSkuResponse(
+                    id=sku.id,
+                    name=sku.name,
+                    price=sku.price,
+                    discount=sku.discount,
+                    image=sku.image,
+                    active_quantity=sku.active_quantity,
+                    in_stock=sku.active_quantity > 0,
+                    characteristics=sku.characteristics,
+                )
+                for sku in product.skus
+            ],
+        )
     if x_service_key is not None:
         if x_service_key != expected_service_key:
             raise HTTPException(

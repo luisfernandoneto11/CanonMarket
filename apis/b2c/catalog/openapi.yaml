@@ -220,7 +220,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Product'
+                $ref: '#/components/schemas/ProductCard'
               example:
                 id: "770e8400-e29b-41d4-a716-446655440002"
                 slug: "iphone-14-pro"
@@ -1011,6 +1011,62 @@ components:
         - status
         - characteristics
         - skus
+
+    ProductCardSku:
+      type: object
+      required: [id, name, price, discount, image, active_quantity, in_stock, characteristics]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        price:
+          type: integer
+          description: Price in kopecks
+        discount:
+          type: integer
+          minimum: 0
+        image:
+          type: string
+        active_quantity:
+          type: integer
+          minimum: 0
+        in_stock:
+          type: boolean
+        characteristics:
+          type: array
+          items:
+            $ref: '#/components/schemas/Characteristic'
+      description: Public SKU representation. Seller cost and reservation fields are intentionally absent.
+
+    ProductCard:
+      type: object
+      required: [id, title, description, status, images, characteristics, skus]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [MODERATED]
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/Image'
+        characteristics:
+          type: array
+          items:
+            $ref: '#/components/schemas/Characteristic'
+        skus:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductCardSku'
+      description: Public B2C product card. It does not expose seller_id, cost_price, reserved_quantity, or moderation diagnostics.
 
     ProductShort:
       type: object

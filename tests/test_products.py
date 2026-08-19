@@ -812,3 +812,54 @@ def test_category_filters_include_dynamic_characteristics():
     assert any(item["name"] == "Brand" for item in response.json()["items"])
 
 
+
+# Task 9 — B2C product card
+
+def test_product_card_returns_full_data_with_skus():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.get(f"/api/v1/products/{product_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == product_id
+    assert body["title"]
+    assert body["description"]
+    assert body["images"]
+    assert body["skus"]
+    assert body["skus"][0]["price"] > 0
+
+
+def test_cost_price_absent_in_response():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.get(f"/api/v1/products/{product_id}")
+    assert response.status_code == 200
+    sku = response.json()["skus"][0]
+    assert "cost_price" not in sku
+    assert "reserved_quantity" not in sku
+
+
+def test_blocked_product_returns_404_for_b2c_card():
+    product_id = make_moderated_product(active_quantity=5)
+    store.products[product_id].status = "BLOCKED"
+    response = client.get(f"/api/v1/products/{product_id}")
+    assert response.status_code == 404
+    assert response.json()["code"] == "NOT_FOUND"
+
+
+def test_sku_without_stock_is_shown_as_unavailable():
+    product_id = make_moderated_product(active_quantity=5)
+    store.products[product_id].skus[0].active_quantity = 0
+    response = client.get(f"/api/v1/products/{product_id}")
+    assert response.status_code == 200
+    sku = response.json()["skus"][0]
+    assert sku["in_stock"] is False
+    assert sku["active_quantity"] == 0
+
+
+def test_b2c_card_does_not_expose_seller_or_moderation_fields():
+    product_id = make_moderated_product(active_quantity=5)
+    body = client.get(f"/api/v1/products/{product_id}").json()
+    assert "seller_id" not in body
+    assert "deleted" not in body
+    assert "blocking_reason" not in body
+    assert "field_reports" not in body
+
