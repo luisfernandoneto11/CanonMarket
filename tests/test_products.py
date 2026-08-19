@@ -62,6 +62,8 @@ def setup_function():
     store.b2c_events.clear()
     store.processed_moderation_events.clear()
     store.cart_items.clear()
+    store.orders.clear()
+    store.orders_by_idempotency.clear()
 
 
 def test_create_product_returns_201_with_created_status():
@@ -863,3 +865,71 @@ def test_b2c_card_does_not_expose_seller_or_moderation_fields():
     assert "blocking_reason" not in body
     assert "field_reports" not in body
 
+
+
+def test_checkout_creates_paid_order_with_fixed_prices():
+    sku_id = make_cart_sku(5)
+    product = next(product for product in store.products.values() if product.skus[0].id == sku_id)
+    headers = {"Authorization": f"Bearer {cart_jwt()}"}
+    key = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    response = client.post(
+        "/api/v1/orders",
+        json={"idempotency_key": key, "items": [{"sku_id": sku_id, "quantity": 2}]},
+        headers=headers,
+    )
+
+    assert response.status_code == 201
+    order = response.json()
+    assert order["status"] == "PAID"
+    assert order["items"][0]["unit_price"] == 12999000
+    assert order["items"][0]["product_title"] == product.title
+    assert order["items"][0]["sku_name"] == product.skus[0].name
+    assert order["total_amount"] == 25998000
+    assert product.skus[0].active_quantity == 3
+    product.skus[0].price = 999
+    assert store.orders[order["id"]].items[0].unit_price == 12999000
+
+
+def test_partial_reserve_failure_returns_409():
+    first_sku = make_cart_sku(5)
+    second_sku = make_cart_sku(0)
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "idempotency_key": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "items": [{"sku_id": first_sku, "quantity": 2}, {"sku_id": second_sku, "quantity": 1}],
+        },
+        headers={"Authorization": f"Bearer {cart_jwt()}"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "RESERVE_FAILED"
+    assert response.json()["failed_items"][0]["sku_id"] == second_sku
+    assert next(sku for product in store.products.values() for sku in product.skus if sku.id == first_sku).active_quantity == 5
+
+
+def test_idempotency_returns_existing_order():
+    sku_id = make_cart_sku(5)
+    headers = {"Authorization": f"Bearer {cart_jwt()}"}
+    payload = {"idempotency_key": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 1}]}
+
+    first = client.post("/api/v1/orders", json=payload, headers=headers)
+    second = client.post("/api/v1/orders", json=payload, headers=headers)
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id).active_quantity == 4
+
+
+def test_b2b_unavailable_returns_503(monkeypatch):
+    sku_id = make_cart_sku(5)
+    monkeypatch.setenv("B2B_CHECKOUT_UNAVAILABLE", "1")
+    response = client.post(
+        "/api/v1/orders",
+        json={"idempotency_key": "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "items": [{"sku_id": sku_id, "quantity": 1}]},
+        headers={"Authorization": f"Bearer {cart_jwt()}"},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"code": "B2B_UNAVAILABLE", "message": "Product service temporarily unavailable"}

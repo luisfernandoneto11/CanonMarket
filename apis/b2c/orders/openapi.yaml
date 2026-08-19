@@ -2,9 +2,176 @@ openapi: 3.0.3
 info:
   title: "NeoMarket B2C: Заказы"
   version: "0.1"
-  description: |
-    Проектируется синдикатом QA Corps.
-    Домены: оформление заказа, статусы (state machine), отмена, история заказов.
-
-paths: {}
-# Здесь команды QA Corps описывают свои эндпоинты
+  description: Checkout endpoint with atomic inventory reservation and idempotent order creation.
+servers:
+  - url: /
+paths:
+  /api/v1/orders:
+    post:
+      summary: Create a paid order from checkout items
+      operationId: createOrder
+      security:
+        - bearerHttpAuthentication: []
+      parameters:
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequest'
+      responses:
+        '201':
+          description: Order created and inventory reserved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '200':
+          description: Existing order returned for a repeated idempotency key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '401':
+          description: Authentication required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '409':
+          description: All-or-nothing reservation failed; no order is created and no stock is consumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReserveFailedError'
+        '503':
+          description: B2B product service is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+components:
+  securitySchemes:
+    bearerHttpAuthentication:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    OrderCreateItem:
+      type: object
+      required: [sku_id, quantity]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+    OrderCreateRequest:
+      type: object
+      required: [idempotency_key, items]
+      properties:
+        idempotency_key:
+          type: string
+          format: uuid
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderCreateItem'
+        delivery_address:
+          type: string
+          nullable: true
+    OrderItem:
+      type: object
+      required: [sku_id, product_id, product_title, sku_name, quantity, unit_price, line_total]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        product_title:
+          type: string
+        sku_name:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+        unit_price:
+          type: integer
+          description: Fixed purchase price in kopecks.
+        line_total:
+          type: integer
+    Order:
+      type: object
+      required: [id, user_id, status, total_amount, idempotency_key, items]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PAID]
+        total_amount:
+          type: integer
+        idempotency_key:
+          type: string
+          format: uuid
+        delivery_address:
+          type: string
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+    FailedItem:
+      type: object
+      required: [sku_id, requested, available, reason]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        requested:
+          type: integer
+        available:
+          type: integer
+        reason:
+          type: string
+          enum: [OUT_OF_STOCK, INSUFFICIENT_STOCK, PRODUCT_BLOCKED, PRODUCT_DELETED, SKU_NOT_FOUND]
+    ReserveFailedError:
+      type: object
+      required: [code, message, failed_items]
+      properties:
+        code:
+          type: string
+          enum: [RESERVE_FAILED]
+        message:
+          type: string
+        failed_items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailedItem'
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
