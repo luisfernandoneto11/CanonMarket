@@ -97,27 +97,42 @@ paths:
 
   /api/v1/products/{id}/decline:
     post:
-      summary: Заблокировать товар (с причиной)
+      summary: Block a product; hard_block=true creates terminal HARD_BLOCKED status
       tags: [Decisions]
+      security:
+        - bearerHttpAuthentication: []
       parameters:
         - name: id
           in: path
           required: true
           schema:
-            type: integer
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              # Что нужно, чтобы продавец понял что исправить?
-              # Достаточно общей причины — или надо указать конкретные поля?
+              $ref: '#/components/schemas/ModerationDeclineRequest'
       responses:
-        "200":
-          description: Товар заблокирован, статус → BLOCKED
-        "404":
-          description: Товар не найден в очереди
+        '200':
+          description: Product blocked; status is HARD_BLOCKED when hard_block=true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModerationActionResponse'
+        '400':
+          description: Invalid hard-block request.
+        '401':
+          description: Authentication required.
+        '403':
+          description: Card is assigned to another moderator.
+        '404':
+          description: Product not found in moderation queue.
+        '409':
+          description: Product is not in review or is already terminal.
+        '503':
+          description: B2B event destination unavailable.
 
   /api/v1/product-blocking-reasons:
     get:
@@ -186,3 +201,43 @@ components:
         ignored:
           type: boolean
           default: false
+    ModerationDeclineRequest:
+      type: object
+      required: [blocking_reason, hard_block]
+      properties:
+        blocking_reason:
+          $ref: '#/components/schemas/BlockingReason'
+        moderator_comment:
+          type: string
+          maxLength: 1000
+        field_reports:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldReport'
+        hard_block:
+          type: boolean
+          enum: [true]
+          description: Must be true for the terminal HARD_BLOCKED transition.
+    BlockingReason:
+      type: object
+      required: [id, title, comment]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        comment:
+          type: string
+    FieldReport:
+      type: object
+      required: [field_name, comment]
+      properties:
+        field_name:
+          type: string
+        sku_id:
+          type: string
+          format: uuid
+          nullable: true
+        comment:
+          type: string
