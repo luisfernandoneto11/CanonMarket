@@ -341,6 +341,43 @@ class ModerationDecisionResponse(BaseModel):
     ok: bool
 
 
+class ModerationActionRequest(BaseModel):
+    moderator_comment: str | None = Field(default=None, max_length=1000)
+
+
+class ModerationActionResponse(BaseModel):
+    product_id: str
+    status: str
+
+
+class ProductEventRequest(BaseModel):
+    product_id: str
+    seller_id: str
+    event: str
+    date: str
+
+    @field_validator("product_id", "seller_id")
+    @classmethod
+    def event_ids_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("identifier must be a valid UUID") from None
+        return value
+
+    @field_validator("event")
+    @classmethod
+    def event_must_be_supported(cls, value: str) -> str:
+        if value not in {"CREATED", "EDITED", "DELETED"}:
+            raise ValueError("event must be CREATED, EDITED, or DELETED")
+        return value
+
+
+class ProductEventResponse(BaseModel):
+    ok: bool
+    ignored: bool = False
+
+
 class UpdateProductRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, min_length=1, max_length=5000)
@@ -510,6 +547,9 @@ class ProductStore:
     orders: dict[str, OrderResponse] = field(default_factory=dict)
     orders_by_idempotency: dict[str, str] = field(default_factory=dict)
     cancellation_errors: list[dict[str, str]] = field(default_factory=list)
+    moderator_assignments: dict[str, str] = field(default_factory=dict)
+    moderation_outgoing_events: list[dict[str, Any]] = field(default_factory=list)
+    processed_product_events: set[tuple[str, str, str]] = field(default_factory=set)
 
     def _find_sku(self, sku_id: str) -> tuple[ProductResponse | None, SkuResponse | None]:
         for product in self.products.values():
@@ -639,6 +679,67 @@ class ProductStore:
             )
         self.processed_moderation_events.add(payload.idempotency_key)
         return ModerationDecisionResponse(ok=True)
+
+    def _emit_moderation_event(self, product: ProductResponse, status_value: str, hard_block: bool = False, blocking_reason: BlockingReason | None = None) -> None:
+        event_key = f"{product.id}:{status_value}:{str(hard_block).lower()}"
+        if any(event.get("event_key") == event_key for event in self.moderation_outgoing_events):
+            return
+        if os.getenv("B2B_MODERATION_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
+        event = {
+            "event_key": event_key,
+            "idempotency_key": str(uuid.uuid5(uuid.NAMESPACE_URL, event_key)),
+            "product_id": product.id,
+            "status": status_value,
+            "hard_block": hard_block,
+        }
+        if blocking_reason is not None:
+            event["blocking_reason"] = blocking_reason.model_dump()
+        self.moderation_outgoing_events.append(event)
+
+    def approve_product(self, product_id: str, moderator_id: str, comment: str | None = None) -> ModerationActionResponse:
+        product = self.products.get(product_id)
+        if product is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump())
+        if product.status == "HARD_BLOCKED":
+            raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product is permanently blocked").model_dump())
+        if product.status != "IN_REVIEW":
+            raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product is not in review status").model_dump())
+        if self.moderator_assignments.get(product_id) != moderator_id:
+            raise HTTPException(status_code=403, detail=ApiError(code="FORBIDDEN", message="This moderation card is not assigned to you").model_dump())
+        if not product.skus:
+            raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product has no SKUs, cannot approve").model_dump())
+        self._emit_moderation_event(product, "MODERATED")
+        product.status = "MODERATED"
+        product.blocked = False
+        product.blocking_reason = None
+        product.field_reports = []
+        self.moderator_assignments.pop(product_id, None)
+        return ModerationActionResponse(product_id=product.id, status=product.status)
+
+    def apply_product_event(self, payload: ProductEventRequest) -> ProductEventResponse:
+        product = self.products.get(payload.product_id)
+        if product is None:
+            if payload.event == "DELETED":
+                return ProductEventResponse(ok=True, ignored=True)
+            raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="Product not found").model_dump())
+        event_key = (payload.product_id, payload.event, payload.date)
+        if event_key in self.processed_product_events:
+            return ProductEventResponse(ok=True, ignored=True)
+        if payload.event == "EDITED" and product.status == "HARD_BLOCKED":
+            self.processed_product_events.add(event_key)
+            return ProductEventResponse(ok=True, ignored=True)
+        if payload.event == "DELETED":
+            product.deleted = True
+            product.status = "DELETED"
+            self.moderator_assignments.pop(product.id, None)
+        elif payload.event == "EDITED":
+            product.status = "ON_MODERATION"
+            product.blocked = False
+        else:
+            product.status = "ON_MODERATION"
+        self.processed_product_events.add(event_key)
+        return ProductEventResponse(ok=True)
 
     def create(self, payload: CreateProductRequest, seller_id: str) -> ProductResponse:
         product_id = str(uuid.uuid4())
@@ -899,6 +1000,18 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("invalid JWT claims")
     return payload
+
+
+def get_moderator_id(authorization: Annotated[str | None, Header()] = None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Bearer token is required").model_dump())
+    try:
+        claims = _decode_jwt_payload(authorization[7:].strip())
+        moderator_id = claims.get("moderator_id") or claims.get("sub") or claims.get("user_id")
+        uuid.UUID(str(moderator_id))
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="moderator_id claim is required").model_dump()) from None
+    return str(moderator_id)
 
 
 def get_seller_id(authorization: Annotated[str | None, Header()] = None) -> str:
@@ -1443,6 +1556,38 @@ def merge_guest_cart(
 def _valid_moderation_service_key(value: str | None) -> bool:
     expected = os.getenv("MOD_TO_B2B_KEY", "development-service-key")
     return value is not None and value == expected
+
+
+@app.post(
+    "/api/v1/products/{product_id}/approve",
+    response_model=ModerationActionResponse,
+    responses={401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def approve_product(
+    product_id: str,
+    moderator_id: Annotated[str, Depends(get_moderator_id)],
+    payload: ModerationActionRequest | None = None,
+) -> ModerationActionResponse:
+    try:
+        uuid.UUID(product_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump()) from None
+    return store.approve_product(product_id, moderator_id, payload.moderator_comment if payload else None)
+
+
+@app.post(
+    "/api/v1/events/product",
+    response_model=ProductEventResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}},
+)
+def apply_product_event(
+    payload: ProductEventRequest,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> ProductEventResponse:
+    expected = os.getenv("B2B_TO_MOD_KEY", "development-service-key")
+    if x_service_key != expected:
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    return store.apply_product_event(payload)
 
 
 @app.post(

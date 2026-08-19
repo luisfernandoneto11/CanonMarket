@@ -66,6 +66,9 @@ def setup_function():
     store.orders.clear()
     store.orders_by_idempotency.clear()
     store.cancellation_errors.clear()
+    store.moderator_assignments.clear()
+    store.moderation_outgoing_events.clear()
+    store.processed_product_events.clear()
 
 
 def test_create_product_returns_201_with_created_status():
@@ -996,3 +999,84 @@ def test_other_user_order_returns_404():
 
     assert response.status_code == 404
     assert response.json()["code"] == "ORDER_NOT_FOUND"
+
+
+MODERATOR_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+OTHER_MODERATOR_ID = "b1c2d3e4-f5a6-7890-bcde-f12345678901"
+
+
+def moderator_jwt(moderator_id: str = MODERATOR_ID) -> str:
+    def part(value: dict) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{part({'alg': 'none', 'typ': 'JWT'})}.{part({'moderator_id': moderator_id})}.signature"
+
+
+def make_review_product(with_sku: bool = True) -> str:
+    product_id = create_product()
+    if with_sku:
+        response = client.post(
+            "/api/v1/skus", json=sku_payload(product_id), headers={"Authorization": f"Bearer {jwt_for()}"}
+        )
+        assert response.status_code == 201
+    store.products[product_id].status = "IN_REVIEW"
+    return product_id
+
+
+def test_approve_transitions_to_moderated_and_emits_event():
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+
+    response = client.post(
+        f"/api/v1/products/{product_id}/approve",
+        json={"moderator_comment": "Card verified"},
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"product_id": product_id, "status": "MODERATED"}
+    assert store.products[product_id].status == "MODERATED"
+    assert store.moderation_outgoing_events[-1]["status"] == "MODERATED"
+    assert store.moderation_outgoing_events[-1]["product_id"] == product_id
+    assert store.moderation_outgoing_events[-1]["hard_block"] is False
+
+
+def test_approve_others_card_returns_403():
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+
+    response = client.post(
+        f"/api/v1/products/{product_id}/approve",
+        headers={"Authorization": f"Bearer {moderator_jwt(OTHER_MODERATOR_ID)}"},
+    )
+
+    assert response.status_code == 403
+    assert store.products[product_id].status == "IN_REVIEW"
+
+
+def test_approve_after_edited_returns_409():
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+    store.products[product_id].status = "ON_MODERATION"
+
+    response = client.post(
+        f"/api/v1/products/{product_id}/approve",
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 409
+    assert store.products[product_id].status == "ON_MODERATION"
+
+
+def test_approve_without_sku_returns_409():
+    product_id = make_review_product(with_sku=False)
+    store.moderator_assignments[product_id] = MODERATOR_ID
+
+    response = client.post(
+        f"/api/v1/products/{product_id}/approve",
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 409
+    assert "no SKUs" in response.json()["message"]

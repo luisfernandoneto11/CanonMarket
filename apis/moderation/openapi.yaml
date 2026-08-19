@@ -13,6 +13,36 @@ info:
     5. Одобряет или блокирует — и сообщает B2B (формат события — ???)
 
 paths:
+  /api/v1/events/product:
+    post:
+      summary: Receive a product lifecycle event from B2B
+      tags: [Events]
+      security:
+        - serviceKey: []
+      parameters:
+        - name: X-Service-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductEventRequest'
+      responses:
+        '200':
+          description: Event accepted or ignored idempotently.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductEventResponse'
+        '400':
+          description: Invalid product event.
+        '401':
+          description: Invalid service key.
+
   /api/v1/product-moderation/get-next:
     post:
       summary: Следующая карточка из очереди
@@ -32,17 +62,38 @@ paths:
     post:
       summary: Одобрить товар
       tags: [Decisions]
+      security:
+        - bearerHttpAuthentication: []
       parameters:
         - name: id
           in: path
           required: true
           schema:
-            type: integer
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModerationActionRequest'
       responses:
-        "200":
-          description: Товар одобрен, статус → MODERATED
-        "404":
-          description: Товар не найден в очереди
+        '200':
+          description: Product approved and MODERATED event emitted to B2B.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModerationActionResponse'
+        '401':
+          description: Authentication required.
+        '403':
+          description: Card is assigned to another moderator.
+        '404':
+          description: Product not found in moderation queue.
+        '409':
+          description: Product is not in review or has no SKUs.
+        '503':
+          description: B2B event destination unavailable; card remains IN_REVIEW.
 
   /api/v1/products/{id}/decline:
     post:
@@ -82,3 +133,56 @@ paths:
                 items:
                   type: object
                   # Формат — проектируется
+
+components:
+  securitySchemes:
+    bearerHttpAuthentication:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    serviceKey:
+      type: apiKey
+      in: header
+      name: X-Service-Key
+  schemas:
+    ModerationActionRequest:
+      type: object
+      properties:
+        moderator_comment:
+          type: string
+          maxLength: 1000
+    ModerationActionResponse:
+      type: object
+      required: [product_id, status]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [MODERATED]
+    ProductEventRequest:
+      type: object
+      required: [product_id, seller_id, event, date]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        seller_id:
+          type: string
+          format: uuid
+        event:
+          type: string
+          enum: [CREATED, EDITED, DELETED]
+        date:
+          type: string
+          format: date-time
+    ProductEventResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        ignored:
+          type: boolean
+          default: false
