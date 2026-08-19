@@ -386,6 +386,7 @@ paths:
           in: query
           schema:
             type: string
+
             enum: [rating, popularity, price_asc, price_desc, date_desc, discount_desc]
             default: rating
         - name: filters[Brand]
@@ -400,6 +401,10 @@ paths:
           schema:
             type: string
             format: uuid
+
+            enum: [price_asc, price_desc, date_desc]
+            default: date_desc
+
         - name: ids
           in: query
           description: Lista de UUIDs separada por vírgulas; IDs invisíveis são omitidos.
@@ -448,6 +453,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiError"
+
 
   /api/v1/catalog/facets:
     get:
@@ -562,6 +568,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiError"
+
 
   /api/v1/reserve:
     post:

@@ -103,3 +103,4 @@ neomarket-canon/
 | `schema-syntax` | YAML front-matter + mermaid блоки | warning-only |
 
 Все три — warning-only: они не блокируют PR, но сигнализируют о проблемах.
+# CanonMarket

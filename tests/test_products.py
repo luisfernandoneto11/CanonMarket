@@ -697,6 +697,7 @@ def test_guest_cart_merged_on_login():
     assert client.get("/api/v1/cart", headers=guest_headers).json()["items"] == []
 
 
+
 # Task 8 — catalog filters and facets
 
 def test_catalog_filters_by_characteristic_and_sort():
@@ -809,3 +810,5 @@ def test_category_filters_include_dynamic_characteristics():
     response = client.get("/api/v1/categories/" + CATEGORY_ID + "/filters", headers={"X-Service-Key": "development-service-key"})
     assert response.status_code == 200
     assert any(item["name"] == "Brand" for item in response.json()["items"])
+
+
