@@ -455,10 +455,15 @@ class OrderItemResponse(BaseModel):
 class OrderResponse(BaseModel):
     id: str
     user_id: str
+    buyer_id: str
     status: str
+    subtotal: int
+    total: int
     total_amount: int
     idempotency_key: str
+    address: str | None = None
     delivery_address: str | None = None
+    created_at: str
     items: list[OrderItemResponse]
 
 
@@ -759,24 +764,49 @@ class ProductStore:
             )
             for product, sku, quantity in snapshots
         ]
+        order_total = sum(item.line_total for item in order_items)
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         order = OrderResponse(
             id=str(uuid.uuid4()),
             user_id=user_id,
+            buyer_id=user_id,
             status="PAID",
-            total_amount=sum(item.line_total for item in order_items),
+            subtotal=order_total,
+            total=order_total,
+            total_amount=order_total,
             idempotency_key=payload.idempotency_key,
+            address=payload.delivery_address,
             delivery_address=payload.delivery_address,
+            created_at=created_at,
             items=order_items,
         )
         self.orders[order.id] = order
         self.orders_by_idempotency[payload.idempotency_key] = order.id
         return order, True
 
+    def unreserve_via_b2b(self, payload: UnreserveRequest) -> UnreserveResponse:
+        if os.getenv("B2B_UNRESERVE_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Inventory unreserve unavailable").model_dump())
+        b2b_url = os.getenv("B2B_URL") or os.getenv("B2B_INVENTORY_URL")
+        if not b2b_url:
+            return self.unreserve(payload)
+        response = httpx.post(
+            f"{b2b_url.rstrip('/')}/api/v1/inventory/unreserve",
+            headers={"X-Service-Key": os.getenv("B2C_TO_B2B_KEY", "development-service-key")},
+            json=payload.model_dump(),
+            timeout=5.0,
+        )
+        if response.status_code not in {200, 202, 204}:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Inventory unreserve unavailable").model_dump())
+        result = UnreserveResponse(ok=True)
+        self.unreserve_operations[payload.order_id] = result
+        return result
+
     def cancel_order(self, order_id: str, user_id: str) -> OrderResponse:
         order = self.orders.get(order_id)
         if order is None or order.user_id != user_id:
             raise HTTPException(status_code=404, detail=ApiError(code="ORDER_NOT_FOUND", message="Order not found").model_dump())
-        if order.status not in {"CREATED", "PAID"}:
+        if order.status not in {"CREATED", "PAID", "ASSEMBLING", "DELIVERING"}:
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -793,7 +823,7 @@ class ProductStore:
             return order
 
         try:
-            self.unreserve(
+            self.unreserve_via_b2b(
                 UnreserveRequest(
                     order_id=order.id,
                     items=[ReserveItem(sku_id=item.sku_id, quantity=item.quantity) for item in order.items],

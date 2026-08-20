@@ -977,15 +977,58 @@ def test_unreserve_failure_transitions_to_cancel_pending(monkeypatch):
     assert sku.active_quantity == 5
 
 
-def test_cancel_assembling_order_returns_409():
+def test_cancel_assembling_order_transitions_to_cancelled():
     order_id, _ = _create_checkout_order_for_cancel()
     store.orders[order_id].status = "ASSEMBLING"
 
     response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
 
-    assert response.status_code == 409
-    assert response.json()["code"] == "CANCEL_NOT_ALLOWED"
-    assert response.json()["current_status"] == "ASSEMBLING"
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+
+
+def test_cancel_delivering_order_transitions_to_cancelled():
+    order_id, _ = _create_checkout_order_for_cancel()
+    store.orders[order_id].status = "DELIVERING"
+
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+
+
+def test_cancel_calls_canonical_b2b_unreserve(monkeypatch):
+    order_id, sku_id = _create_checkout_order_for_cancel()
+    calls: list[dict] = []
+
+    class FakeResponse:
+        status_code = 204
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setenv("B2B_URL", "https://b2b.internal")
+    monkeypatch.setattr("app.main.httpx.post", fake_post)
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+    assert calls[0]["url"] == "https://b2b.internal/api/v1/inventory/unreserve"
+    assert calls[0]["json"]["order_id"] == order_id
+    assert calls[0]["json"]["items"][0]["sku_id"] == sku_id
+
+
+def test_cancel_response_contains_contract_order_fields():
+    order_id, _ = _create_checkout_order_for_cancel()
+    response = client.post(f"/api/v1/orders/{order_id}/cancel", headers={"Authorization": f"Bearer {cart_jwt()}"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["buyer_id"] == body["user_id"]
+    assert body["subtotal"] == body["total"] == body["total_amount"]
+    assert "address" in body
+    assert body["created_at"]
 
 
 def test_other_user_order_returns_404():

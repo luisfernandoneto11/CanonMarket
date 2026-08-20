@@ -160,7 +160,7 @@ components:
           type: integer
     Order:
       type: object
-      required: [id, user_id, status, total_amount, idempotency_key, items]
+      required: [id, user_id, buyer_id, status, subtotal, total, total_amount, idempotency_key, address, created_at, items]
       properties:
         id:
           type: string
@@ -168,17 +168,30 @@ components:
         user_id:
           type: string
           format: uuid
+        buyer_id:
+          type: string
+          format: uuid
         status:
           type: string
           enum: [CREATED, PAID, ASSEMBLING, DELIVERING, DELIVERED, CANCELLED, CANCEL_PENDING]
+        subtotal:
+          type: integer
+        total:
+          type: integer
         total_amount:
           type: integer
         idempotency_key:
           type: string
           format: uuid
+        address:
+          type: string
+          nullable: true
         delivery_address:
           type: string
           nullable: true
+        created_at:
+          type: string
+          format: date-time
         items:
           type: array
           items:
