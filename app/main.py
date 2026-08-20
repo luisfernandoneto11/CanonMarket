@@ -34,17 +34,20 @@ class ApiError(BaseModel):
 
 
 class Image(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # The published B2B Image schema does not require either property.
+    # Defaults preserve a normalized response while accepting every allowed request shape.
+    model_config = ConfigDict(extra="ignore")
 
-    url: str = Field(min_length=1)
-    ordering: int = Field(ge=0)
+    url: str = ""
+    ordering: int = 0
 
 
 class Characteristic(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # CharacteristicValue exposes optional properties in the shared contract.
+    model_config = ConfigDict(extra="ignore")
 
-    name: str = Field(min_length=1)
-    value: str = Field(min_length=1)
+    name: str = ""
+    value: str = ""
 
 
 class CreateProductRequest(BaseModel):
@@ -86,8 +89,8 @@ class ProductResponse(BaseModel):
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[Any]
-    blocking_reason_id: str | None = None
-    moderator_comment: str | None = None
+    blocking_reason_id: str | None
+    moderator_comment: str | None
     created_at: str
     updated_at: str
 

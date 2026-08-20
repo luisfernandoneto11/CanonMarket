@@ -116,3 +116,18 @@ def test_unknown_category_returns_400():
 
     assert response.status_code == 400
     assert response.json() == {"code": "INVALID_REQUEST", "message": "Category not found"}
+
+
+def test_create_product_accepts_images_without_optional_ordering_and_sparse_characteristics():
+    payload = product_payload()
+    payload["images"] = [{"url": "/s3/iphone15-front.jpg"}]
+    payload["characteristics"] = [{}]
+    response = client.post(
+        "/api/v1/products", json=payload, headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["images"] == [{"url": "/s3/iphone15-front.jpg", "ordering": 0}]
+    assert body["characteristics"] == [{"name": "", "value": ""}]
+    assert set(("id", "seller_id", "title", "description", "status", "deleted", "blocked", "category_id", "category", "slug", "images", "characteristics", "skus", "blocking_reason_id", "moderator_comment", "created_at", "updated_at")) <= set(body)
+    assert set(("id", "name")) <= set(body["category"])
