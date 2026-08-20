@@ -927,6 +927,38 @@ def test_idempotency_returns_existing_order():
     assert next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id).active_quantity == 4
 
 
+def test_idempotency_same_key_with_different_body_returns_conflict():
+    sku_id = make_cart_sku(5)
+    headers = {"Authorization": f"Bearer {cart_jwt()}", "Idempotency-Key": "12121212-1212-4212-8212-121212121212"}
+    first_payload = {"address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 1}]}
+    second_payload = {**first_payload, "items": [{"sku_id": sku_id, "quantity": 2}]}
+    assert client.post("/api/v1/orders", json=first_payload, headers=headers).status_code == 201
+    conflict = client.post("/api/v1/orders", json=second_payload, headers=headers)
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_b2b_reserve_rejection_returns_checkout_conflict(monkeypatch):
+    sku_id = make_cart_sku(5)
+
+    class FakeResponse:
+        status_code = 409
+        @staticmethod
+        def json():
+            return {"failed_items": [{"sku_id": sku_id, "requested": 2, "available": 1, "reason": "INSUFFICIENT_STOCK"}]}
+
+    monkeypatch.setenv("B2B_URL", "http://b2b.test")
+    monkeypatch.setattr("app.main.httpx.post", lambda *args, **kwargs: FakeResponse())
+    response = client.post(
+        "/api/v1/orders",
+        json={"address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 2}]},
+        headers={"Authorization": f"Bearer {cart_jwt()}", "Idempotency-Key": "13131313-1313-4313-8313-131313131313"},
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "RESERVE_FAILED"
+    assert response.json()["failed_items"][0]["reason"] == "INSUFFICIENT_STOCK"
+
+
 def test_b2b_unavailable_returns_503(monkeypatch):
     sku_id = make_cart_sku(5)
     monkeypatch.setenv("B2B_CHECKOUT_UNAVAILABLE", "1")
@@ -951,7 +983,7 @@ def test_checkout_requires_idempotency_header():
         headers={"Authorization": f"Bearer {cart_jwt()}"},
     )
     assert response.status_code == 400
-    assert response.json() == {"code": "MISSING_IDEMPOTENCY_KEY", "message": "Idempotency-Key header is required"}
+    assert response.json() == {"code": "INVALID_REQUEST", "message": "Field required"}
 
 
 def test_checkout_reserves_through_b2b_inventory_endpoint(monkeypatch):

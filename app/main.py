@@ -430,7 +430,6 @@ class OrderCreateRequest(BaseModel):
     address_id: str
     payment_method_id: str
     delivery_address: str | None = None
-    idempotency_key: str | None = None
 
     @field_validator("address_id", "payment_method_id")
     @classmethod
@@ -442,15 +441,6 @@ class OrderCreateRequest(BaseModel):
                 raise ValueError("identifier must be a valid UUID") from None
         return value
 
-    @field_validator("idempotency_key")
-    @classmethod
-    def idempotency_key_must_be_uuid(cls, value: str | None) -> str | None:
-        if value is not None:
-            try:
-                uuid.UUID(value)
-            except (ValueError, AttributeError):
-                raise ValueError("idempotency_key must be a valid UUID") from None
-        return value
 
 
 class OrderItemResponse(BaseModel):
@@ -472,7 +462,7 @@ class OrderResponse(BaseModel):
     total: int
     total_amount: int
     idempotency_key: str
-    address: str | None = None
+    address: str | None
     delivery_address: str | None = None
     created_at: str
     items: list[OrderItemResponse]
@@ -525,6 +515,7 @@ class ProductStore:
     cart_items: dict[str, dict[str, Any]] = field(default_factory=dict)
     orders: dict[str, OrderResponse] = field(default_factory=dict)
     orders_by_idempotency: dict[str, str] = field(default_factory=dict)
+    order_request_fingerprints: dict[str, str] = field(default_factory=dict)
 
     def _find_sku(self, sku_id: str) -> tuple[ProductResponse | None, SkuResponse | None]:
         for product in self.products.values():
@@ -731,18 +722,24 @@ class ProductStore:
         b2b_url = os.getenv("B2B_URL") or os.getenv("B2B_INVENTORY_URL")
         if not b2b_url:
             return self.reserve(payload)
-        response = httpx.post(
-            f"{b2b_url.rstrip('/')}/api/v1/inventory/reserve",
-            headers={"X-Service-Key": os.getenv("B2C_TO_B2B_KEY", "development-service-key")},
-            json={"order_id": order_id, **payload.model_dump()},
-            timeout=5.0,
-        )
-        if response.status_code not in {200, 201, 202}:
-            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Inventory reserve unavailable").model_dump())
+        try:
+            response = httpx.post(
+                f"{b2b_url.rstrip('/')}/api/v1/inventory/reserve",
+                headers={"X-Service-Key": os.getenv("B2C_TO_B2B_KEY", "development-service-key")},
+                json={"order_id": order_id, **payload.model_dump()},
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Inventory reserve unavailable").model_dump()) from exc
         try:
             body = response.json()
         except ValueError:
             body = {}
+        if response.status_code == 409:
+            failed_items = [ReserveFailedItem(**item) for item in body.get("failed_items", [])]
+            return ReserveResponse(reserved=False, items=[], failed_items=failed_items)
+        if response.status_code not in {200, 201, 202}:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="Inventory reserve unavailable").model_dump())
         return ReserveResponse(
             reserved=bool(body.get("reserved", True)),
             items=[ReserveSuccessItem(**item) for item in body.get("reserved_items", body.get("items", []))],
@@ -750,8 +747,11 @@ class ProductStore:
         )
 
     def create_order(self, user_id: str, payload: OrderCreateRequest, idempotency_key: str) -> tuple[OrderResponse, bool]:
+        fingerprint = json.dumps(payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         existing_id = self.orders_by_idempotency.get(idempotency_key)
         if existing_id is not None:
+            if self.order_request_fingerprints.get(idempotency_key) != fingerprint:
+                raise HTTPException(status_code=409, detail=ApiError(code="IDEMPOTENCY_CONFLICT", message="Idempotency-Key was already used with a different request").model_dump())
             return self.orders[existing_id], False
 
         quantities: dict[str, int] = {}
@@ -814,6 +814,7 @@ class ProductStore:
         )
         self.orders[order.id] = order
         self.orders_by_idempotency[idempotency_key] = order.id
+        self.order_request_fingerprints[idempotency_key] = fingerprint
         return order, True
 
     def unreserve(self, payload: UnreserveRequest) -> UnreserveResponse:
@@ -1323,11 +1324,10 @@ def get_cart_identity(
 def create_order(
     payload: OrderCreateRequest,
     response: Response,
-    authorization: Annotated[str | None, Header()] = None,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    authorization: Annotated[str, Header()],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> OrderResponse:
     user_id = get_checkout_user_id(authorization)
-    idempotency_key = idempotency_key or payload.idempotency_key
     if not idempotency_key:
         raise HTTPException(status_code=400, detail=ApiError(code="MISSING_IDEMPOTENCY_KEY", message="Idempotency-Key header is required").model_dump())
     try:
@@ -1336,6 +1336,9 @@ def create_order(
         raise HTTPException(status_code=400, detail=ApiError(code="INVALID_IDEMPOTENCY_KEY", message="Idempotency-Key must be a valid UUID").model_dump()) from None
     existing_id = store.orders_by_idempotency.get(idempotency_key)
     if existing_id is not None:
+        fingerprint = json.dumps(payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        if store.order_request_fingerprints.get(idempotency_key) != fingerprint:
+            raise HTTPException(status_code=409, detail=ApiError(code="IDEMPOTENCY_CONFLICT", message="Idempotency-Key was already used with a different request").model_dump())
         response.status_code = status.HTTP_200_OK
         return store.orders[existing_id]
     if os.getenv("B2B_CHECKOUT_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
