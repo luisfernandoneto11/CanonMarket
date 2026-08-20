@@ -35,17 +35,19 @@ class ApiError(BaseModel):
 
 
 class Image(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Shared B2B Image has optional properties; defaults normalize sparse input.
+    model_config = ConfigDict(extra="ignore")
 
-    url: str = Field(min_length=1)
-    ordering: int = Field(ge=0)
+    url: str = ""
+    ordering: int = 0
 
 
 class Characteristic(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Shared B2B CharacteristicValue has optional properties.
+    model_config = ConfigDict(extra="ignore")
 
-    name: str = Field(min_length=1)
-    value: str = Field(min_length=1)
+    name: str = ""
+    value: str = ""
 
 
 class CreateProductRequest(BaseModel):

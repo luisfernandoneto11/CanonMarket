@@ -243,3 +243,36 @@ def test_add_sku_requires_name_and_uses_integer_price():
     )
     assert response.status_code == 400
     assert response.json()["code"] == "INVALID_REQUEST"
+
+
+def test_create_sku_accepts_contract_optional_fields_and_sparse_nested_values():
+    product_id = create_product_for_sku()
+    payload = {
+        "product_id": product_id,
+        "name": "Minimal SKU",
+        "price": 100,
+        "images": [{}],
+        "characteristics": [{}],
+    }
+    response = client.post(
+        "/api/v1/skus", json=payload, headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["cost_price"] == 0
+    assert body["discount"] == 0
+    assert body["article"].startswith("SKU-")
+    assert body["images"] == [{"url": "", "ordering": 0}]
+    assert body["characteristics"] == [{"name": "", "value": ""}]
+    assert set(("id", "product_id", "name", "price", "discount", "cost_price", "active_quantity", "reserved_quantity", "article", "images", "characteristics", "created_at", "updated_at")) <= set(body)
+
+
+def test_create_sku_rejects_unknown_request_fields_with_flat_error():
+    product_id = create_product_for_sku()
+    payload = sku_payload(product_id)
+    payload["unexpected"] = True
+    response = client.post(
+        "/api/v1/skus", json=payload, headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 400
+    assert set(response.json()) == {"code", "message"}
