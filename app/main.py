@@ -188,18 +188,24 @@ class ProductCardSkuResponse(BaseModel):
     price: int
     discount: int
     image: str
-    active_quantity: int
-    in_stock: bool
+    available_quantity: int
+    has_stock: bool
     characteristics: list[Characteristic]
+    # Legacy aliases are retained in the response for existing clients.
+    active_quantity: int | None = None
+    in_stock: bool | None = None
 
 
 class ProductCardResponse(BaseModel):
     id: str
     title: str
+    name: str
     description: str
     status: str
     images: list[Image]
     characteristics: list[Characteristic]
+    min_price: int
+    has_stock: bool
     skus: list[ProductCardSkuResponse]
 
 
@@ -1167,6 +1173,11 @@ def create_sku(
 
 
 @app.get(
+    "/api/v1/catalog/products/{product_id}",
+    response_model=ProductCardResponse,
+    responses={400: {"model": ApiError}, 404: {"model": ApiError}},
+)
+@app.get(
     "/api/v1/products/{product_id}",
     response_model=ProductResponse | ProductCardResponse,
     responses={401: {"model": ApiError}, 404: {"model": ApiError}},
@@ -1207,10 +1218,13 @@ def get_product(
         return ProductCardResponse(
             id=product.id,
             title=product.title,
+            name=product.title,
             description=product.description,
             status=product.status,
             images=product.images,
             characteristics=product.characteristics,
+            min_price=min(sku.price for sku in product.skus),
+            has_stock=any(sku.active_quantity > 0 for sku in product.skus),
             skus=[
                 ProductCardSkuResponse(
                     id=sku.id,
@@ -1218,6 +1232,8 @@ def get_product(
                     price=sku.price,
                     discount=sku.discount,
                     image=sku.image,
+                    available_quantity=sku.active_quantity,
+                    has_stock=sku.active_quantity > 0,
                     active_quantity=sku.active_quantity,
                     in_stock=sku.active_quantity > 0,
                     characteristics=sku.characteristics,

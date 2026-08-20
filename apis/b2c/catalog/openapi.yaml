@@ -203,6 +203,29 @@ paths:
               example:
                 message: "Internal server error"
 
+  /api/v1/catalog/products/{product_id}:
+    get:
+      summary: Получить публичную карточку товара
+      security: []
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Публичная карточка товара
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogProductDetail'
+        '400':
+          description: Некорректный идентификатор
+        '404':
+          description: Товар не найден или недоступен
+
   /api/v1/products/{id}:
     get:
       summary: Получить полный товар
@@ -1011,6 +1034,65 @@ components:
         - status
         - characteristics
         - skus
+
+    CatalogProductSku:
+      type: object
+      required: [id, name, price, discount, image, available_quantity, has_stock, characteristics]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        price:
+          type: integer
+        discount:
+          type: integer
+          minimum: 0
+        image:
+          type: string
+        available_quantity:
+          type: integer
+          minimum: 0
+        has_stock:
+          type: boolean
+        characteristics:
+          type: array
+          items:
+            $ref: '#/components/schemas/Characteristic'
+
+    CatalogProductDetail:
+      type: object
+      required: [id, title, name, description, status, images, characteristics, skus, min_price, has_stock]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [MODERATED]
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/Image'
+        characteristics:
+          type: array
+          items:
+            $ref: '#/components/schemas/Characteristic'
+        min_price:
+          type: integer
+        has_stock:
+          type: boolean
+        skus:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogProductSku'
 
     ProductCardSku:
       type: object

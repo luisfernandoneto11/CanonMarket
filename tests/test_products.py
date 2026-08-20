@@ -987,3 +987,28 @@ def test_checkout_reserves_through_b2b_inventory_endpoint(monkeypatch):
     assert calls[0][0] == "http://b2b.test/api/v1/inventory/reserve"
     assert calls[0][1]["json"]["order_id"] == response.json()["id"]
     assert calls[0][1]["json"]["items"][0]["sku_id"] == sku_id
+
+
+def test_public_catalog_product_card_matches_catalog_detail_contract():
+    product_id = make_moderated_product(active_quantity=4)
+    response = client.get(f"/api/v1/catalog/products/{product_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == product_id
+    assert body["title"] == "Visible phone"
+    assert body["name"] == "Visible phone"
+    assert body["min_price"] == 12999000
+    assert body["has_stock"] is True
+    sku = body["skus"][0]
+    assert sku["available_quantity"] == 4
+    assert sku["has_stock"] is True
+    assert "cost_price" not in sku
+    assert "reserved_quantity" not in sku
+
+
+def test_public_catalog_product_card_invalid_or_hidden_product_returns_404():
+    invalid = client.get("/api/v1/catalog/products/not-a-uuid")
+    assert invalid.status_code == 404
+    hidden_id = create_product(status="BLOCKED")
+    hidden = client.get(f"/api/v1/catalog/products/{hidden_id}")
+    assert hidden.status_code == 404
