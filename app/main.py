@@ -289,8 +289,17 @@ class UnreserveRequest(BaseModel):
         return value
 
 
+class UnreserveItemResponse(BaseModel):
+    sku_id: str
+    unreserved_quantity: int
+    remaining_reserved: int
+    active_quantity: int
+
+
 class UnreserveResponse(BaseModel):
     ok: bool
+    order_id: str
+    items: list[UnreserveItemResponse]
 
 
 class ModerationDecisionRequest(BaseModel):
@@ -682,11 +691,20 @@ class ProductStore:
                     detail=ApiError(code="CONFLICT", message="Reserved quantity is insufficient").model_dump(),
                 )
 
+        released_items: list[UnreserveItemResponse] = []
         for sku_id, quantity in requested.items():
             sku = sku_map[sku_id]
             sku.active_quantity += quantity
             sku.reserved_quantity -= quantity
-        result = UnreserveResponse(ok=True)
+            released_items.append(
+                UnreserveItemResponse(
+                    sku_id=sku.id,
+                    unreserved_quantity=quantity,
+                    remaining_reserved=sku.reserved_quantity,
+                    active_quantity=sku.active_quantity,
+                )
+            )
+        result = UnreserveResponse(ok=True, order_id=payload.order_id, items=released_items)
         self.unreserve_operations[payload.order_id] = result
         return result
 
@@ -1087,7 +1105,12 @@ def reserve_skus(
         )
     result = store.reserve(payload)
     if not result.reserved:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.model_dump())
+        reason = result.failed_items[0].reason if result.failed_items else "INSUFFICIENT_STOCK"
+        message = "SKU is out of stock" if reason == "OUT_OF_STOCK" else "Insufficient stock"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=ApiError(code=reason, message=message).model_dump(),
+        )
     return result
 
 

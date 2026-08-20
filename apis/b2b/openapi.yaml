@@ -321,6 +321,24 @@ components:
               reason:
                 type: string
                 enum: [OUT_OF_STOCK, INSUFFICIENT_STOCK]
+    UnreserveItemResponse:
+      type: object
+      required: [sku_id, unreserved_quantity, remaining_reserved, active_quantity]
+      properties:
+        sku_id: {type: string, format: uuid}
+        unreserved_quantity: {type: integer, minimum: 1}
+        remaining_reserved: {type: integer, minimum: 0}
+        active_quantity: {type: integer, minimum: 0}
+    UnreserveResponse:
+      type: object
+      required: [ok, order_id, items]
+      properties:
+        ok: {type: boolean}
+        order_id: {type: string, format: uuid}
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/UnreserveItemResponse"
     UnreserveRequest:
       type: object
       required: [order_id, items]
@@ -595,7 +613,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ReserveResponse"
+                $ref: "#/components/schemas/ApiError"
 
   /api/v1/inventory/unreserve:
     post:
@@ -615,15 +633,15 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [ok]
-                properties:
-                  ok:
-                    type: boolean
+                $ref: "#/components/schemas/UnreserveResponse"
         "401":
           description: X-Service-Key ausente ou inválido
         "409":
           description: Reserved quantity is insufficient
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 
   /api/v1/events/moderation:
     post:

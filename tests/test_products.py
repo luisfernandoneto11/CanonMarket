@@ -1,5 +1,6 @@
 import base64
 import json
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -444,7 +445,8 @@ def test_partial_insufficient_stock_returns_409_all_rollback():
     )
 
     assert response.status_code == 409
-    assert response.json()["reserved"] is False
+    assert set(response.json()) == {"code", "message"}
+    assert response.json()["code"] == "INSUFFICIENT_STOCK"
     all_skus = [sku for product in store.products.values() for sku in product.skus]
     assert next(sku for sku in all_skus if sku.id == first_sku).active_quantity == 5
     assert next(sku for sku in all_skus if sku.id == first_sku).reserved_quantity == 0
@@ -530,7 +532,13 @@ def test_unreserve_restores_quantities():
     )
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True}
+    body = response.json()
+    assert body["ok"] is True
+    assert body["order_id"] == "66666666-6666-4666-8666-666666666666"
+    assert body["items"][0]["sku_id"] == sku_id
+    assert body["items"][0]["unreserved_quantity"] == 3
+    assert body["items"][0]["remaining_reserved"] == 0
+    assert body["items"][0]["active_quantity"] == 5
     sku = next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id)
     assert sku.active_quantity == 5
     assert sku.reserved_quantity == 0
@@ -864,3 +872,54 @@ def test_sku_out_of_stock_event_is_delivered_to_b2c(monkeypatch):
     assert calls[0]["headers"]["X-Service-Key"] == "development-service-key"
     assert calls[0]["json"]["event_type"] == "SKU_OUT_OF_STOCK"
     assert calls[0]["json"]["sku_id"] == sku_id
+
+
+def test_reserve_conflict_uses_api_error_schema():
+    product_id = create_product()
+    product = store.products[product_id]
+    product.status = "MODERATED"
+    response = client.post(
+        "/api/v1/skus", json=sku_payload(product_id), headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 201
+    sku_id = product.skus[0].id
+    conflict = client.post(
+        "/api/v1/inventory/reserve",
+        json={"order_id": str(uuid.uuid4()), "idempotency_key": str(uuid.uuid4()), "items": [{"sku_id": sku_id, "quantity": 1}]},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert conflict.status_code == 409
+    assert set(conflict.json()) == {"code", "message"}
+    assert conflict.json()["code"] in {"OUT_OF_STOCK", "INSUFFICIENT_STOCK"}
+
+
+def test_unreserve_returns_complete_operation_state():
+    product_id = create_product()
+    product = store.products[product_id]
+    product.status = "MODERATED"
+    response = client.post(
+        "/api/v1/skus", json=sku_payload(product_id), headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 201
+    product.skus[0].active_quantity = 1
+    sku_id = product.skus[0].id
+    order_id = str(uuid.uuid4())
+    reserve = client.post(
+        "/api/v1/inventory/reserve",
+        json={"order_id": order_id, "idempotency_key": str(uuid.uuid4()), "items": [{"sku_id": sku_id, "quantity": 1}]},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert reserve.status_code == 200
+    released = client.post(
+        "/api/v1/inventory/unreserve",
+        json={"order_id": order_id, "items": [{"sku_id": sku_id, "quantity": 1}]},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert released.status_code == 200
+    body = released.json()
+    assert body["ok"] is True
+    assert body["order_id"] == order_id
+    assert body["items"][0]["sku_id"] == sku_id
+    assert body["items"][0]["unreserved_quantity"] == 1
+    assert body["items"][0]["remaining_reserved"] == 0
+    assert body["items"][0]["active_quantity"] == 1
