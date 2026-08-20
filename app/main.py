@@ -147,12 +147,16 @@ class ProductResponse(BaseModel):
     status: str
     deleted: bool
     blocked: bool
+    category_id: str
     category: CategoryRef
+    slug: str
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[SkuResponse]
     blocking_reason: BlockingReason | None = None
     field_reports: list[FieldReport] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
 
 
 class PublicSkuResponse(BaseModel):
@@ -164,6 +168,21 @@ class PublicSkuResponse(BaseModel):
     image: str
     active_quantity: int
     characteristics: list[Characteristic]
+
+
+class PublicProductDetailResponse(BaseModel):
+    id: str
+    title: str
+    description: str
+    status: str
+    category_id: str
+    category: CategoryRef
+    slug: str
+    images: list[Image]
+    characteristics: list[Characteristic]
+    skus: list[PublicSkuResponse]
+    created_at: str
+    updated_at: str
 
 
 class CatalogProductResponse(BaseModel):
@@ -302,6 +321,8 @@ class ProductStore:
 
     def create(self, payload: CreateProductRequest, seller_id: str) -> ProductResponse:
         product_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        slug = "-".join(payload.title.lower().split()) or product_id
         product = ProductResponse(
             id=product_id,
             seller_id=seller_id,
@@ -310,6 +331,7 @@ class ProductStore:
             status="CREATED",
             deleted=False,
             blocked=False,
+            category_id=payload.category_id,
             category=CategoryRef(
                 id=payload.category_id,
                 name=CATEGORY_NAMES.get(payload.category_id, "Category"),
@@ -319,6 +341,9 @@ class ProductStore:
             skus=[],
             blocking_reason=None,
             field_reports=[],
+            created_at=now,
+            updated_at=now,
+            slug=slug,
         )
         self.products[product_id] = product
         return product
@@ -500,6 +525,35 @@ def _valid_b2c_service_key(value: str | None) -> bool:
     return value is not None and value == expected
 
 
+def _to_public_product_detail(product: ProductResponse) -> PublicProductDetailResponse:
+    return PublicProductDetailResponse(
+        id=product.id,
+        title=product.title,
+        description=product.description,
+        status=product.status,
+        category_id=product.category_id,
+        category=product.category,
+        slug=product.slug,
+        images=product.images,
+        characteristics=product.characteristics,
+        skus=[
+            PublicSkuResponse(
+                id=sku.id,
+                product_id=sku.product_id,
+                name=sku.name,
+                price=sku.price,
+                discount=sku.discount,
+                image=sku.image,
+                active_quantity=sku.active_quantity,
+                characteristics=sku.characteristics,
+            )
+            for sku in product.skus
+        ],
+        created_at=product.created_at,
+        updated_at=product.updated_at,
+    )
+
+
 def _to_catalog_product(product: ProductResponse) -> CatalogProductResponse:
     return CatalogProductResponse(
         id=product.id,
@@ -630,15 +684,15 @@ def create_sku(
 
 @app.get(
     "/api/v1/products/{product_id}",
-    response_model=ProductResponse,
+    response_model=ProductResponse | PublicProductDetailResponse,
     responses={401: {"model": ApiError}, 404: {"model": ApiError}},
 )
 def get_product(
     product_id: str,
     authorization: Annotated[str | None, Header()] = None,
     x_service_key: Annotated[str | None, Header()] = None,
-) -> ProductResponse:
-    """Return a seller-owned product or a Moderation-authorized product.
+) -> ProductResponse | PublicProductDetailResponse:
+    """Return a full seller detail or a redacted public service-key detail.
 
     Seller access deliberately returns 404 for another seller's product to avoid
     revealing whether the resource exists. Moderation may use X-Service-Key to
@@ -666,7 +720,7 @@ def get_product(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ApiError(code="UNAUTHORIZED", message="Invalid service key").model_dump(),
             )
-        return product
+        return _to_public_product_detail(product)
 
     seller_id = get_seller_id(authorization)
     if product.seller_id != seller_id:

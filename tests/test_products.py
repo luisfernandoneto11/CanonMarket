@@ -256,10 +256,35 @@ def test_get_moderated_product_returns_full_payload():
     assert body["status"] == "MODERATED"
     assert body["title"] == "iPhone 15 Pro Max"
     assert body["description"] == "Flagship smartphone"
+    assert body["category_id"] == CATEGORY_ID
+    assert body["slug"] == "iphone-15-pro-max"
+    assert body["created_at"].endswith("Z")
+    assert body["updated_at"].endswith("Z")
     assert body["skus"][0]["cost_price"] == 9500000
     assert body["skus"][0]["reserved_quantity"] == 0
     assert body["blocking_reason"] is None
     assert body["field_reports"] == []
+
+
+def test_service_key_product_detail_redacts_internal_sku_economics():
+    product_id = make_moderated_product(active_quantity=5)
+
+    response = client.get(
+        f"/api/v1/products/{product_id}",
+        headers={"X-Service-Key": "development-service-key"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == product_id
+    assert body["category_id"] == CATEGORY_ID
+    assert body["slug"] == "iphone-15-pro-max"
+    sku = body["skus"][0]
+    assert "cost_price" not in sku
+    assert "reserved_quantity" not in sku
+    assert "seller_id" not in body
+    assert "blocking_reason" not in body
+    assert "field_reports" not in body
 
 
 def test_get_blocked_product_returns_blocking_reason_and_field_reports():

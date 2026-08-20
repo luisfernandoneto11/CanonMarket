@@ -139,7 +139,7 @@ components:
           type: string
     ProductDetail:
       type: object
-      required: [id, seller_id, title, description, status, deleted, blocked, category, images, characteristics, skus, blocking_reason, field_reports]
+      required: [id, seller_id, title, description, status, deleted, blocked, category_id, category, slug, images, characteristics, skus, blocking_reason, field_reports, created_at, updated_at]
       properties:
         id:
           type: string
@@ -158,6 +158,11 @@ components:
           type: boolean
         blocked:
           type: boolean
+        category_id:
+          type: string
+          format: uuid
+        slug:
+          type: string
         category:
           type: object
           properties:
@@ -186,6 +191,41 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/FieldReport"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PublicProductDetail:
+      type: object
+      required: [id, title, description, status, category_id, category, slug, images, characteristics, skus, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        title: {type: string}
+        description: {type: string}
+        status: {type: string}
+        category_id: {type: string, format: uuid}
+        category:
+          type: object
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+        slug: {type: string}
+        images:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/Image"
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+        skus:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicSkuResponse"
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
     PublicSkuResponse:
       type: object
       required: [id, product_id, name, price, discount, image, active_quantity, characteristics]
@@ -489,7 +529,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProductDetail"
+                oneOf:
+                  - $ref: "#/components/schemas/ProductDetail"
+                  - $ref: "#/components/schemas/PublicProductDetail"
         "401":
           description: Отсутствует или некорректен JWT или service key
           content:
