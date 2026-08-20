@@ -1,5 +1,6 @@
 import base64
 import json
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -845,14 +846,44 @@ def test_blocked_product_returns_404_for_b2c_card():
     assert response.json()["code"] == "NOT_FOUND"
 
 
+def test_catalog_card_reads_full_product_from_b2b_and_prices_available_skus(monkeypatch):
+    product_id = make_moderated_product(active_quantity=5)
+    product = store.products[product_id]
+    sku = product.skus[0]
+    sku.active_quantity = 0
+    second = sku.model_copy(update={"id": str(uuid.uuid4()), "name": "Available", "price": 222, "image": "/available.jpg", "active_quantity": 3})
+    product.skus.append(second)
+    monkeypatch.setenv("B2B_URL", "https://b2b.internal")
+
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {
+                "id": product_id, "title": "B2B title", "name": "B2B name", "description": "B2B description", "status": "MODERATED", "deleted": False,
+                "images": [], "characteristics": [], "skus": [
+                    {"id": sku.id, "product_id": product_id, "name": "Unavailable", "price": 111, "discount": 0, "image": "/old.jpg", "active_quantity": 0, "characteristics": []},
+                    {"id": second.id, "product_id": product_id, "name": "Available", "price": 222, "discount": 0, "image": "/available.jpg", "active_quantity": 3, "characteristics": []},
+                ],
+            }
+
+    monkeypatch.setattr("app.main.httpx.get", lambda *args, **kwargs: FakeResponse())
+    response = client.get(f"/api/v1/catalog/products/{product_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["title"] == "B2B title"
+    assert body["min_price"] == 222
+    assert body["has_stock"] is True
+    assert body["skus"][0]["available_quantity"] == 0
+
+
 def test_sku_without_stock_is_shown_as_unavailable():
     product_id = make_moderated_product(active_quantity=5)
     store.products[product_id].skus[0].active_quantity = 0
     response = client.get(f"/api/v1/products/{product_id}")
     assert response.status_code == 200
     sku = response.json()["skus"][0]
-    assert sku["in_stock"] is False
-    assert sku["active_quantity"] == 0
+    assert sku["has_stock"] is False
+    assert sku["available_quantity"] == 0
 
 
 def test_b2c_card_does_not_expose_seller_or_moderation_fields():

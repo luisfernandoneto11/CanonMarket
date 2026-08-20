@@ -191,9 +191,6 @@ class ProductCardSkuResponse(BaseModel):
     available_quantity: int
     has_stock: bool
     characteristics: list[Characteristic]
-    # Legacy aliases are retained in the response for existing clients.
-    active_quantity: int | None = None
-    in_stock: bool | None = None
 
 
 class ProductCardResponse(BaseModel):
@@ -1172,6 +1169,25 @@ def create_sku(
     return sku
 
 
+def _fetch_b2b_public_product(product_id: str) -> dict[str, Any]:
+    base_url = os.getenv("B2B_URL") or os.getenv("B2B_SERVICE_URL")
+    if not base_url:
+        product = store.products.get(product_id)
+        if product is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+        return product.model_dump()
+    headers = {"X-Service-Key": os.getenv("B2C_TO_B2B_KEY", "development-service-key")}
+    try:
+        response = httpx.get(f"{base_url.rstrip('/')}/api/v1/public/products/{product_id}", headers=headers, timeout=5.0)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B catalog service unavailable").model_dump()) from exc
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+    if response.status_code != 200:
+        raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B catalog service unavailable").model_dump())
+    return response.json()
+
+
 @app.get(
     "/api/v1/catalog/products/{product_id}",
     response_model=ProductCardResponse,
@@ -1201,6 +1217,37 @@ def get_product(
             detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
         ) from None
 
+    expected_service_key = os.getenv("B2B_TO_MOD_KEY", "development-service-key")
+    if x_service_key is None and authorization is None:
+        public_product = _fetch_b2b_public_product(product_id)
+        public_skus = public_product.get("skus", [])
+        if public_product.get("status") != "MODERATED" or public_product.get("deleted", False) or not public_skus:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+        available_skus = [sku for sku in public_skus if sku.get("active_quantity", 0) > 0]
+        return ProductCardResponse(
+            id=public_product["id"],
+            title=public_product["title"],
+            name=public_product.get("name", public_product["title"]),
+            description=public_product["description"],
+            status=public_product["status"],
+            images=[Image.model_validate(image) for image in public_product.get("images", [])],
+            characteristics=[Characteristic.model_validate(characteristic) for characteristic in public_product.get("characteristics", [])],
+            min_price=min((sku.get("price", 0) for sku in available_skus), default=0),
+            has_stock=bool(available_skus),
+            skus=[
+                ProductCardSkuResponse(
+                    id=sku["id"],
+                    name=sku["name"],
+                    price=sku["price"],
+                    discount=sku.get("discount", 0),
+                    image=sku.get("image", ""),
+                    available_quantity=sku.get("active_quantity", 0),
+                    has_stock=sku.get("active_quantity", 0) > 0,
+                    characteristics=[Characteristic.model_validate(characteristic) for characteristic in sku.get("characteristics", [])],
+                )
+                for sku in public_skus
+            ],
+        )
     product = store.products.get(product_id)
     if product is None:
         raise HTTPException(
@@ -1208,39 +1255,6 @@ def get_product(
             detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
         )
 
-    expected_service_key = os.getenv("B2B_TO_MOD_KEY", "development-service-key")
-    if x_service_key is None and authorization is None:
-        if product.status != "MODERATED" or product.deleted or not product.skus:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
-            )
-        return ProductCardResponse(
-            id=product.id,
-            title=product.title,
-            name=product.title,
-            description=product.description,
-            status=product.status,
-            images=product.images,
-            characteristics=product.characteristics,
-            min_price=min(sku.price for sku in product.skus),
-            has_stock=any(sku.active_quantity > 0 for sku in product.skus),
-            skus=[
-                ProductCardSkuResponse(
-                    id=sku.id,
-                    name=sku.name,
-                    price=sku.price,
-                    discount=sku.discount,
-                    image=sku.image,
-                    available_quantity=sku.active_quantity,
-                    has_stock=sku.active_quantity > 0,
-                    active_quantity=sku.active_quantity,
-                    in_stock=sku.active_quantity > 0,
-                    characteristics=sku.characteristics,
-                )
-                for sku in product.skus
-            ],
-        )
     if x_service_key is not None:
         if x_service_key != expected_service_key:
             raise HTTPException(
