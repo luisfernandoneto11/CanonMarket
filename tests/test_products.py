@@ -531,3 +531,29 @@ def test_unreserve_restores_quantities():
     sku = next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id)
     assert sku.active_quantity == 5
     assert sku.reserved_quantity == 0
+
+
+def test_seller_detail_nested_entities_match_b2b_product_detail():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.get(
+        f"/api/v1/products/{product_id}", headers={"Authorization": f"Bearer {jwt_for()}"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(("id", "seller_id", "title", "description", "status", "deleted", "blocked", "category_id", "category", "slug", "images", "characteristics", "skus", "blocking_reason", "field_reports", "created_at", "updated_at")) <= set(body)
+    assert set(("id", "name")) <= set(body["category"])
+    assert set(("id", "product_id", "name", "price", "cost_price", "discount", "image", "active_quantity", "reserved_quantity", "characteristics")) <= set(body["skus"][0])
+
+
+def test_service_detail_matches_public_product_detail_and_public_sku_schema():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.get(
+        f"/api/v1/products/{product_id}", headers={"X-Service-Key": "development-service-key"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(("id", "title", "description", "status", "category_id", "category", "slug", "images", "characteristics", "skus", "created_at", "updated_at")) <= set(body)
+    assert set(("id", "product_id", "name", "price", "discount", "image", "active_quantity", "characteristics")) <= set(body["skus"][0])
+    assert "seller_id" not in body
+    assert "cost_price" not in body["skus"][0]
+    assert "reserved_quantity" not in body["skus"][0]

@@ -34,17 +34,19 @@ class ApiError(BaseModel):
 
 
 class Image(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Shared B2B Image has optional properties; normalize omitted nested values.
+    model_config = ConfigDict(extra="ignore")
 
-    url: str = Field(min_length=1)
-    ordering: int = Field(ge=0)
+    url: str = ""
+    ordering: int = 0
 
 
 class Characteristic(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Shared B2B CharacteristicValue has optional properties.
+    model_config = ConfigDict(extra="ignore")
 
-    name: str = Field(min_length=1)
-    value: str = Field(min_length=1)
+    name: str = ""
+    value: str = ""
 
 
 class CreateProductRequest(BaseModel):
@@ -122,8 +124,8 @@ class SkuResponse(BaseModel):
     cost_price: int
     discount: int
     image: str
-    active_quantity: int = 0
-    reserved_quantity: int = 0
+    active_quantity: int
+    reserved_quantity: int
     characteristics: list[Characteristic]
 
 
@@ -153,8 +155,8 @@ class ProductResponse(BaseModel):
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[SkuResponse]
-    blocking_reason: BlockingReason | None = None
-    field_reports: list[FieldReport] = Field(default_factory=list)
+    blocking_reason: BlockingReason | None
+    field_reports: list[FieldReport]
     created_at: str
     updated_at: str
 
@@ -444,6 +446,8 @@ class ProductStore:
             cost_price=payload.cost_price,
             discount=payload.discount,
             image=payload.image,
+            active_quantity=0,
+            reserved_quantity=0,
             characteristics=payload.characteristics,
         )
         is_first_sku = len(product.skus) == 0
