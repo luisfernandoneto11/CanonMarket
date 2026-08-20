@@ -189,6 +189,10 @@ class CatalogResponse(BaseModel):
     offset: int
 
 
+class PublicBatchRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
 class FacetValue(BaseModel):
     value: str
     count: int
@@ -825,6 +829,116 @@ def _catalog_sort_key(product: ProductResponse, sort: str) -> tuple[Any, ...]:
         return (-max(sku.discount for sku in skus),)
     # In-memory products are insertion ordered; this is deterministic for the MVP.
     return (0,)
+
+
+def _public_product_or_404(product_id: str) -> ProductResponse:
+    try:
+        uuid.UUID(product_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump()) from None
+    product = store.products.get(product_id)
+    if product is None or product.status != "MODERATED" or product.deleted or not _visible_skus(product):
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+    return product
+
+
+def _public_sku_or_404(sku_id: str) -> tuple[ProductResponse, SkuResponse]:
+    try:
+        uuid.UUID(sku_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="SKU not found").model_dump()) from None
+    for product in store.products.values():
+        if product.status != "MODERATED" or product.deleted:
+            continue
+        for sku in _visible_skus(product):
+            if sku.id == sku_id:
+                return product, sku
+    raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="SKU not found").model_dump())
+
+
+@app.get(
+    "/api/v1/public/products",
+    response_model=CatalogResponse,
+    responses={401: {"model": ApiError}, 502: {"model": ApiError}},
+)
+def public_list_products(
+    request: Request,
+    limit: int = 20,
+    offset: int = 0,
+    category: str | None = None,
+    category_id: str | None = None,
+    search: str | None = None,
+    sort: str = "rating",
+    ids: str | None = None,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> CatalogResponse:
+    return list_catalog_products(request, limit, offset, category, category_id, search, sort, ids, x_service_key)
+
+
+@app.post(
+    "/api/v1/public/products/batch",
+    response_model=CatalogResponse,
+    responses={401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def public_batch_products(
+    payload: PublicBatchRequest,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> CatalogResponse:
+    if not _valid_b2c_service_key(x_service_key):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    products: list[ProductResponse] = []
+    for product_id in payload.ids:
+        try:
+            uuid.UUID(product_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="ids must contain valid UUIDs").model_dump()) from None
+        product = store.products.get(product_id)
+        if product is not None and product.status == "MODERATED" and not product.deleted and _visible_skus(product):
+            products.append(product)
+    return CatalogResponse(
+        items=[_to_catalog_product(product) for product in products],
+        total_count=len(products),
+        limit=len(products),
+        offset=0,
+    )
+
+
+@app.get(
+    "/api/v1/public/products/{product_id}",
+    response_model=CatalogProductResponse,
+    responses={401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def public_product_detail(
+    product_id: str,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> CatalogProductResponse:
+    if not _valid_b2c_service_key(x_service_key):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    return _to_catalog_product(_public_product_or_404(product_id))
+
+
+@app.get(
+    "/api/v1/public/skus/{sku_id}",
+    response_model=PublicSkuResponse,
+    responses={401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def public_sku_detail(
+    sku_id: str,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> PublicSkuResponse:
+    if not _valid_b2c_service_key(x_service_key):
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    _, sku = _public_sku_or_404(sku_id)
+    return PublicSkuResponse(
+        id=sku.id,
+        product_id=sku.product_id,
+        name=sku.name,
+        price=sku.price,
+        discount=sku.discount,
+        image=sku.image,
+        active_quantity=sku.active_quantity,
+        characteristics=sku.characteristics,
+    )
 
 
 @app.get(

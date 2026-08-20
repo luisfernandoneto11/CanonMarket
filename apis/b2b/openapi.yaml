@@ -244,6 +244,15 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PublicSkuResponse"
+    PublicBatchRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: {type: string, format: uuid}
     CatalogResponse:
       type: object
       required: [items, total_count, limit, offset]
@@ -353,6 +362,87 @@ components:
             $ref: "#/components/schemas/FieldReport"
 
 paths:
+  /api/v1/public/products:
+    get:
+      summary: Public B2C product catalog
+      tags: [PublicCatalog]
+      security:
+        - serviceKeyAuth: []
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+        - {name: category_id, in: query, schema: {type: string, format: uuid}}
+        - {name: search, in: query, schema: {type: string}}
+        - {name: sort, in: query, schema: {type: string, default: rating}}
+      responses:
+        "200":
+          description: Moderated, non-deleted products with active stock
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CatalogResponse"}
+        "401": {description: Missing or invalid X-Service-Key}
+        "502": {description: B2B catalog unavailable}
+
+  /api/v1/public/products/batch:
+    post:
+      summary: Public batch product lookup
+      tags: [PublicCatalog]
+      security:
+        - serviceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PublicBatchRequest"}
+      responses:
+        "200":
+          description: Visible products found for the requested IDs
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CatalogResponse"}
+        "400": {description: Invalid UUID in ids}
+        "401": {description: Missing or invalid X-Service-Key}
+
+  /api/v1/public/products/{product_id}:
+    get:
+      summary: Public product detail
+      tags: [PublicCatalog]
+      security:
+        - serviceKeyAuth: []
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          description: Public product detail without internal economics
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CatalogProduct"}
+        "401": {description: Missing or invalid X-Service-Key}
+        "404": {description: Product is not visible or does not exist}
+
+  /api/v1/public/skus/{sku_id}:
+    get:
+      summary: Public SKU detail
+      tags: [PublicCatalog]
+      security:
+        - serviceKeyAuth: []
+      parameters:
+        - name: sku_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          description: Public SKU without cost or reserved quantity
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PublicSkuResponse"}
+        "401": {description: Missing or invalid X-Service-Key}
+        "404": {description: SKU is not visible or does not exist}
+
   /api/v1/products:
     get:
       summary: Catálogo B2C de produtos visíveis
