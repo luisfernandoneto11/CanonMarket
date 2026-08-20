@@ -642,9 +642,10 @@ def test_add_sku_increments_quantity_if_already_in_cart():
     first = client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 2}, headers=headers)
     second = client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 3}, headers=headers)
 
-    assert first.status_code == 201
+    assert first.status_code == 200
+    assert first.json()["item"]["sku_id"] == sku_id
     assert second.status_code == 200
-    assert second.json()["quantity"] == 5
+    assert second.json()["item"]["quantity"] == 5
 
 
 def test_get_cart_enriched_with_b2b_data():
@@ -654,7 +655,7 @@ def test_get_cart_enriched_with_b2b_data():
 
     response = client.get("/api/v1/cart", headers=headers)
 
-    assert added.status_code == 201
+    assert added.status_code == 200
     assert response.status_code == 200
     body = response.json()
     assert body["items"][0]["available"] is True
@@ -667,7 +668,7 @@ def test_get_cart_enriched_with_b2b_data():
 def test_unavailable_sku_shown_with_reason():
     sku_id = make_cart_sku(active_quantity=2)
     headers = {"X-Session-Id": "33333333-3333-4333-8333-333333333333"}
-    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 1}, headers=headers).status_code == 201
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 1}, headers=headers).status_code == 200
     product, sku = store._find_sku(sku_id)
     sku.active_quantity = 0
 
@@ -686,8 +687,8 @@ def test_guest_cart_merged_on_login():
     session = "44444444-4444-4444-8444-444444444444"
     guest_headers = {"X-Session-Id": session}
     auth_headers = {"Authorization": f"Bearer {cart_jwt()}"}
-    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 3}, headers=guest_headers).status_code == 201
-    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 5}, headers=auth_headers).status_code == 201
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 3}, headers=guest_headers).status_code == 200
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 5}, headers=auth_headers).status_code == 200
 
     response = client.post("/api/v1/cart/merge", headers={**auth_headers, "X-Session-Id": session})
 
@@ -695,3 +696,44 @@ def test_guest_cart_merged_on_login():
     assert response.json()["merged"] is True
     assert response.json()["items"][0]["quantity"] == 5
     assert client.get("/api/v1/cart", headers=guest_headers).json()["items"] == []
+
+
+
+def test_cart_contract_patch_delete_by_sku_and_validate():
+    sku_id = make_cart_sku(active_quantity=5)
+    headers = {"X-Session-Id": "55555555-5555-4555-8555-555555555555"}
+    added = client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 2}, headers=headers)
+    assert added.status_code == 200
+    assert set(added.json()) == {"message", "item", "summary"}
+
+    patched = client.patch(f"/api/v1/cart/items/{sku_id}", json={"quantity": 4}, headers=headers)
+    assert patched.status_code == 200
+    assert patched.json()["item"]["quantity"] == 4
+
+    valid = client.post("/api/v1/cart/validate", headers=headers)
+    assert valid.status_code == 200
+    assert valid.json()["is_valid"] is True
+    assert valid.json()["can_checkout"] is True
+    assert valid.json()["total_items"] == 1
+    assert valid.json()["issues"] == []
+
+    deleted = client.delete(f"/api/v1/cart/items/{sku_id}", headers=headers)
+    assert deleted.status_code == 204
+    empty_validation = client.post("/api/v1/cart/validate", headers=headers)
+    assert empty_validation.status_code == 200
+    assert empty_validation.json()["can_checkout"] is False
+
+
+def test_cart_validate_reports_insufficient_stock():
+    sku_id = make_cart_sku(active_quantity=2)
+    headers = {"X-Session-Id": "66666666-6666-4666-8666-666666666666"}
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 2}, headers=headers).status_code == 200
+    product, sku = store._find_sku(sku_id)
+    sku.active_quantity = 1
+
+    response = client.post("/api/v1/cart/validate", headers=headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["is_valid"] is False
+    assert body["can_checkout"] is False
+    assert body["issues"][0]["issue_type"] == "INSUFFICIENT_STOCK"

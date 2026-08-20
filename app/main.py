@@ -353,6 +353,33 @@ class CartResponse(BaseModel):
     checkout_payload: dict[str, Any]
 
 
+class CartMutationResponse(BaseModel):
+    message: str
+    item: CartItemResponse
+    summary: CartSummary
+
+
+class CartValidationRequest(BaseModel):
+    cart_item_ids: list[str] = Field(default_factory=list)
+
+
+class CartValidationIssue(BaseModel):
+    cart_item_id: str
+    sku_id: str
+    issue_type: str
+    severity: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class CartValidationResponse(BaseModel):
+    is_valid: bool
+    can_checkout: bool
+    total_items: int
+    validation_timestamp: str
+    issues: list[CartValidationIssue]
+
+
 class CartMergeResponse(BaseModel):
     merged: bool
     items: list[CartStoredItem]
@@ -433,8 +460,59 @@ class ProductStore:
             raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Cart item not found").model_dump())
         return item
 
+    def cart_item_by_sku(self, owner_type: str, owner_id: str, sku_id: str) -> dict[str, Any]:
+        item = next((candidate for candidate in self.list_cart(owner_type, owner_id) if candidate["sku_id"] == sku_id), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Cart item not found").model_dump())
+        return item
+
     def list_cart(self, owner_type: str, owner_id: str) -> list[dict[str, Any]]:
         return [item for item in self.cart_items.values() if item["owner_type"] == owner_type and item["owner_id"] == owner_id]
+
+    def mutation_response(self, owner_type: str, owner_id: str, sku_id: str, message: str) -> CartMutationResponse:
+        cart = self.enrich_cart(owner_type, owner_id)
+        item = next((candidate for candidate in cart.items if candidate.sku_id == sku_id), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Cart item not found").model_dump())
+        return CartMutationResponse(message=message, item=item, summary=cart.summary)
+
+    def validate_cart(self, owner_type: str, owner_id: str, requested_item_ids: list[str] | None = None) -> CartValidationResponse:
+        selected_ids = set(requested_item_ids or [])
+        stored_items = self.list_cart(owner_type, owner_id)
+        if selected_ids:
+            stored_items = [item for item in stored_items if item["id"] in selected_ids]
+        issues: list[CartValidationIssue] = []
+        for item in stored_items:
+            product, sku = self._find_sku(item["sku_id"])
+            issue_type: str | None = None
+            message = ""
+            details: dict[str, Any] = {"requested": item["quantity"]}
+            if product is None or sku is None or product.deleted:
+                issue_type = "DELETED"
+                message = "SKU or product was deleted"
+            elif product.status in {"BLOCKED", "HARD_BLOCKED"} or product.blocked:
+                issue_type = "BLOCKED"
+                message = "Product is blocked"
+            elif product.status == "ON_MODERATION":
+                issue_type = "ON_MODERATION"
+                message = "Product is on moderation"
+            elif sku.active_quantity == 0:
+                issue_type = "OUT_OF_STOCK"
+                message = "SKU is out of stock"
+            elif sku.active_quantity < item["quantity"]:
+                issue_type = "INSUFFICIENT_STOCK"
+                message = "Insufficient stock"
+                details["available"] = sku.active_quantity
+            if issue_type is not None:
+                issues.append(CartValidationIssue(cart_item_id=item["id"], sku_id=item["sku_id"], issue_type=issue_type, severity="critical", message=message, details=details))
+        total_items = len(stored_items)
+        return CartValidationResponse(
+            is_valid=not issues,
+            can_checkout=total_items > 0 and not issues,
+            total_items=total_items,
+            validation_timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            issues=issues,
+        )
 
     def enrich_cart(self, owner_type: str, owner_id: str) -> CartResponse:
         enriched: list[CartItemResponse] = []
@@ -972,14 +1050,14 @@ def get_cart_identity(
 
 @app.post(
     "/api/v1/cart/items",
-    response_model=CartStoredItem,
+    response_model=CartMutationResponse,
+    status_code=status.HTTP_200_OK,
     responses={400: {"model": ApiError}, 401: {"model": ApiError}, 409: {"model": ApiError}},
 )
-def add_cart_item(payload: CartAddRequest, response: Response, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartStoredItem:
+def add_cart_item(payload: CartAddRequest, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartMutationResponse:
     owner_type, owner_id = identity
-    item, created = store.add_cart_item(owner_type, owner_id, payload)
-    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
-    return CartStoredItem(id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"])
+    store.add_cart_item(owner_type, owner_id, payload)
+    return store.mutation_response(owner_type, owner_id, payload.sku_id, "Cart item added successfully")
 
 
 @app.get(
@@ -1005,15 +1083,47 @@ def update_cart_item(item_id: str, payload: CartQuantityRequest, identity: Annot
     return CartStoredItem(id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"])
 
 
+@app.patch(
+    "/api/v1/cart/items/{sku_id}",
+    response_model=CartMutationResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}},
+)
+def patch_cart_item(sku_id: str, payload: CartQuantityRequest, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartMutationResponse:
+    try:
+        uuid.UUID(sku_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="sku_id must be a valid UUID").model_dump()) from None
+    owner_type, owner_id = identity
+    item = store.cart_item_by_sku(owner_type, owner_id, sku_id)
+    product, sku = store._find_sku(sku_id)
+    if product is None or sku is None or sku.active_quantity < payload.quantity:
+        raise HTTPException(status_code=409, detail=ApiError(code="OUT_OF_STOCK", message="Insufficient stock").model_dump())
+    item["quantity"] = payload.quantity
+    return store.mutation_response(owner_type, owner_id, sku_id, "Cart item quantity updated successfully")
+
+
 @app.delete(
-    "/api/v1/cart/items/{item_id}",
+    "/api/v1/cart/items/{sku_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}},
 )
-def delete_cart_item(item_id: str, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> Response:
-    item = store.owned_cart_item(*identity, item_id)
+def delete_cart_item(sku_id: str, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> Response:
+    try:
+        uuid.UUID(sku_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="sku_id must be a valid UUID").model_dump()) from None
+    item = store.cart_item_by_sku(*identity, sku_id)
     store.cart_items.pop(item["id"], None)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(
+    "/api/v1/cart/validate",
+    response_model=CartValidationResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}},
+)
+def validate_cart(identity: Annotated[tuple[str, str], Depends(get_cart_identity)], payload: CartValidationRequest | None = None) -> CartValidationResponse:
+    return store.validate_cart(*identity, payload.cart_item_ids if payload else None)
 
 
 @app.delete(

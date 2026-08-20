@@ -591,14 +591,8 @@ paths:
               sku_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
               quantity: 1
       responses:
-        "201":
-          description: Товар добавлен как новая позиция
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CartMutationResponse"
         "200":
-          description: SKU уже был в корзине, количество увеличено
+          description: Позиция добавлена или количество существующей позиции увеличено
           content:
             application/json:
               schema:
@@ -1423,6 +1417,76 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
                 
+  /api/v1/cart/items/{sku_id}:
+    parameters:
+      - name: sku_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: "#/components/parameters/XUserId"
+      - $ref: "#/components/parameters/XSessionId"
+    patch:
+      operationId: patchCartItemBySku
+      tags: [Корзина]
+      summary: Изменить количество позиции по SKU
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateCartItemRequest"
+      responses:
+        "200":
+          description: Обогащённое состояние позиции и корзины
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CartMutationResponse"
+        "400": { $ref: "#/components/responses/MissingCartIdentity" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Позиция не найдена }
+        "409": { description: Недостаточно остатков }
+    delete:
+      operationId: deleteCartItemBySku
+      tags: [Корзина]
+      summary: Удалить позицию по SKU
+      responses:
+        "204": { description: Позиция удалена }
+        "400": { $ref: "#/components/responses/MissingCartIdentity" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Позиция не найдена }
+  /api/v1/cart/validate:
+    post:
+      operationId: validateCartPost
+      tags: [Корзина]
+      summary: Проверить актуальность корзины перед checkout
+      parameters:
+        - $ref: "#/components/parameters/XUserId"
+        - $ref: "#/components/parameters/XSessionId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cart_item_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        "200":
+          description: Результат валидации
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CartValidationResponse"
+        "400": { $ref: "#/components/responses/MissingCartIdentity" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
 components:
     
 
