@@ -239,17 +239,19 @@ class ReserveItem(BaseModel):
 
 
 class ReserveRequest(BaseModel):
+    order_id: str
     idempotency_key: str
     items: list[ReserveItem] = Field(min_length=1)
 
-    @field_validator("idempotency_key")
+    @field_validator("order_id", "idempotency_key")
     @classmethod
-    def idempotency_key_must_be_uuid(cls, value: str) -> str:
+    def identifiers_must_be_uuid(cls, value: str) -> str:
         try:
             uuid.UUID(value)
         except (ValueError, AttributeError):
-            raise ValueError("idempotency_key must be a valid UUID") from None
+            raise ValueError("identifier must be a valid UUID") from None
         return value
+
 
 
 class ReserveSuccessItem(BaseModel):
@@ -266,7 +268,9 @@ class ReserveFailedItem(BaseModel):
 
 
 class ReserveResponse(BaseModel):
+    order_id: str
     reserved: bool
+    reserved_items: list[ReserveSuccessItem] = Field(default_factory=list)
     items: list[ReserveSuccessItem] = Field(default_factory=list)
     failed_items: list[ReserveFailedItem] = Field(default_factory=list)
 
@@ -588,49 +592,64 @@ class ProductStore:
         self.products[product_id] = product
         return product
 
+    def _publish_b2c_event(self, event: dict[str, Any]) -> None:
+        self.b2c_events.append(event)
+        b2c_url = os.getenv("B2C_URL") or os.getenv("B2C_EVENT_URL")
+        if not b2c_url:
+            return
+        response = httpx.post(
+            f"{b2c_url.rstrip('/')}/api/v1/events/inventory",
+            headers={"X-Service-Key": os.getenv("B2B_TO_B2C_KEY", "development-service-key")},
+            json=event,
+            timeout=5.0,
+        )
+        if response.status_code not in {200, 202}:
+            raise HTTPException(status_code=502, detail=ApiError(code="B2C_UNAVAILABLE", message="B2C event delivery failed").model_dump())
+
     def reserve(self, payload: ReserveRequest) -> ReserveResponse:
         cached = self.reserve_operations.get(payload.idempotency_key)
         if cached is not None:
             return cached
 
+        requested: dict[str, int] = {}
+        for item in payload.items:
+            requested[item.sku_id] = requested.get(item.sku_id, 0) + item.quantity
+
         sku_map: dict[str, SkuResponse] = {}
         failed: list[ReserveFailedItem] = []
-        for item in payload.items:
-            sku = next((candidate for product in self.products.values() for candidate in product.skus if candidate.id == item.sku_id), None)
+        for sku_id, quantity in requested.items():
+            _, sku = self._find_sku(sku_id)
             if sku is None:
-                failed.append(ReserveFailedItem(sku_id=item.sku_id, requested=item.quantity, available=0, reason="OUT_OF_STOCK"))
-            else:
-                sku_map[item.sku_id] = sku
-                if sku.active_quantity < item.quantity:
-                    reason = "OUT_OF_STOCK" if sku.active_quantity == 0 else "INSUFFICIENT_STOCK"
-                    failed.append(ReserveFailedItem(sku_id=item.sku_id, requested=item.quantity, available=sku.active_quantity, reason=reason))
+                failed.append(ReserveFailedItem(sku_id=sku_id, requested=quantity, available=0, reason="OUT_OF_STOCK"))
+                continue
+            sku_map[sku_id] = sku
+            if sku.active_quantity < quantity:
+                reason = "OUT_OF_STOCK" if sku.active_quantity == 0 else "INSUFFICIENT_STOCK"
+                failed.append(ReserveFailedItem(sku_id=sku_id, requested=quantity, available=sku.active_quantity, reason=reason))
 
         if failed:
-            return ReserveResponse(reserved=False, failed_items=failed)
+            result = ReserveResponse(order_id=payload.order_id, reserved=False, failed_items=failed)
+            self.reserve_operations[payload.idempotency_key] = result
+            return result
 
         result_items: list[ReserveSuccessItem] = []
         out_of_stock_ids: list[str] = []
-        for item in payload.items:
-            sku = sku_map[item.sku_id]
-            sku.active_quantity -= item.quantity
-            sku.reserved_quantity += item.quantity
-            result_items.append(
-                ReserveSuccessItem(
-                    sku_id=sku.id,
-                    reserved_quantity=item.quantity,
-                    remaining_stock=sku.active_quantity,
-                )
-            )
+        for sku_id, quantity in requested.items():
+            sku = sku_map[sku_id]
+            sku.active_quantity -= quantity
+            sku.reserved_quantity += quantity
+            result_items.append(ReserveSuccessItem(sku_id=sku.id, reserved_quantity=quantity, remaining_stock=sku.active_quantity))
             if sku.active_quantity == 0:
                 out_of_stock_ids.append(sku.id)
 
-        result = ReserveResponse(reserved=True, items=result_items)
+        result = ReserveResponse(order_id=payload.order_id, reserved=True, reserved_items=result_items, items=result_items)
         self.reserve_operations[payload.idempotency_key] = result
         for sku_id in out_of_stock_ids:
-            self.b2c_events.append(
+            self._publish_b2c_event(
                 {
                     "idempotency_key": str(uuid.uuid4()),
                     "event": "SKU_OUT_OF_STOCK",
+                    "event_type": "SKU_OUT_OF_STOCK",
                     "sku_id": sku_id,
                     "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 }
@@ -652,10 +671,21 @@ class ProductStore:
                 )
             sku_map[item.sku_id] = sku
 
+        requested: dict[str, int] = {}
         for item in payload.items:
-            sku = sku_map[item.sku_id]
-            sku.active_quantity += item.quantity
-            sku.reserved_quantity -= item.quantity
+            requested[item.sku_id] = requested.get(item.sku_id, 0) + item.quantity
+        for sku_id, quantity in requested.items():
+            sku = sku_map[sku_id]
+            if sku.reserved_quantity < quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=ApiError(code="CONFLICT", message="Reserved quantity is insufficient").model_dump(),
+                )
+
+        for sku_id, quantity in requested.items():
+            sku = sku_map[sku_id]
+            sku.active_quantity += quantity
+            sku.reserved_quantity -= quantity
         result = UnreserveResponse(ok=True)
         self.unreserve_operations[payload.order_id] = result
         return result
@@ -1037,6 +1067,11 @@ def get_product(
 
 
 @app.post(
+    "/api/v1/inventory/reserve",
+    response_model=ReserveResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 409: {"model": ApiError}},
+)
+@app.post(
     "/api/v1/reserve",
     response_model=ReserveResponse,
     responses={400: {"model": ApiError}, 401: {"model": ApiError}, 409: {"model": ApiError}},
@@ -1056,6 +1091,11 @@ def reserve_skus(
     return result
 
 
+@app.post(
+    "/api/v1/inventory/unreserve",
+    response_model=UnreserveResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 409: {"model": ApiError}},
+)
 @app.post(
     "/api/v1/unreserve",
     response_model=UnreserveResponse,

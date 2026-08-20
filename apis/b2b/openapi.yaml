@@ -270,8 +270,11 @@ components:
           minimum: 1
     ReserveRequest:
       type: object
-      required: [idempotency_key, items]
+      required: [order_id, idempotency_key, items]
       properties:
+        order_id:
+          type: string
+          format: uuid
         idempotency_key:
           type: string
           format: uuid
@@ -282,11 +285,14 @@ components:
             $ref: "#/components/schemas/ReserveItem"
     ReserveResponse:
       type: object
-      required: [reserved, items, failed_items]
+      required: [order_id, reserved, reserved_items, failed_items]
       properties:
+        order_id:
+          type: string
+          format: uuid
         reserved:
           type: boolean
-        items:
+        reserved_items:
           type: array
           items:
             type: object
@@ -563,7 +569,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiError"
 
-  /api/v1/reserve:
+  /api/v1/inventory/reserve:
     post:
       summary: Reserve SKU quantities atomically
       tags: [Inventory]
@@ -591,7 +597,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ReserveResponse"
 
-  /api/v1/unreserve:
+  /api/v1/inventory/unreserve:
     post:
       summary: Release a previous reservation
       tags: [Inventory]

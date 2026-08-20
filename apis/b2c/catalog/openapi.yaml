@@ -7,6 +7,27 @@ info:
     Домены: текстовый поиск, фильтры, пагинация, карточка товара, SKU, рекомендации.
 
 paths:
+  /api/v1/events/inventory:
+    post:
+      summary: Receive inventory lifecycle events from B2B
+      security:
+        - serviceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idempotency_key, event_type, sku_id, date]
+              properties:
+                idempotency_key: {type: string, format: uuid}
+                event_type: {type: string, enum: [SKU_OUT_OF_STOCK]}
+                sku_id: {type: string, format: uuid}
+                date: {type: string, format: date-time}
+      responses:
+        '202': {description: Event accepted idempotently}
+        '401': {description: Invalid service key}
+
   /api/v1/products/{product_id}/skus:
     get:
       summary: Получить список SKU товара (кратко - для отображения в карточке)

@@ -407,8 +407,9 @@ def test_reserve_all_skus_succeeds():
     second_sku = make_reservable_sku(3)
 
     response = client.post(
-        "/api/v1/reserve",
+        "/api/v1/inventory/reserve",
         json={
+            "order_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "idempotency_key": "11111111-1111-4111-8111-111111111111",
             "items": [
                 {"sku_id": first_sku, "quantity": 2},
@@ -430,8 +431,9 @@ def test_partial_insufficient_stock_returns_409_all_rollback():
     second_sku = make_reservable_sku(1)
 
     response = client.post(
-        "/api/v1/reserve",
+        "/api/v1/inventory/reserve",
         json={
+            "order_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             "idempotency_key": "22222222-2222-4222-8222-222222222222",
             "items": [
                 {"sku_id": first_sku, "quantity": 2},
@@ -451,13 +453,14 @@ def test_partial_insufficient_stock_returns_409_all_rollback():
 def test_idempotent_reserve_returns_200_without_double_deduction():
     sku_id = make_reservable_sku(5)
     payload = {
+        "order_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
         "idempotency_key": "33333333-3333-4333-8333-333333333333",
         "items": [{"sku_id": sku_id, "quantity": 2}],
     }
     headers = {"X-Service-Key": "development-service-key"}
 
-    first = client.post("/api/v1/reserve", json=payload, headers=headers)
-    second = client.post("/api/v1/reserve", json=payload, headers=headers)
+    first = client.post("/api/v1/inventory/reserve", json=payload, headers=headers)
+    second = client.post("/api/v1/inventory/reserve", json=payload, headers=headers)
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -471,8 +474,9 @@ def test_sku_out_of_stock_event_emitted():
     sku_id = make_reservable_sku(2)
 
     response = client.post(
-        "/api/v1/reserve",
+        "/api/v1/inventory/reserve",
         json={
+            "order_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
             "idempotency_key": "44444444-4444-4444-8444-444444444444",
             "items": [{"sku_id": sku_id, "quantity": 2}],
         },
@@ -483,11 +487,32 @@ def test_sku_out_of_stock_event_emitted():
     assert any(event["event"] == "SKU_OUT_OF_STOCK" and event["sku_id"] == sku_id for event in store.b2c_events)
 
 
+def test_duplicate_sku_lines_are_aggregated_before_reservation():
+    sku_id = make_reservable_sku(5)
+    response = client.post(
+        "/api/v1/inventory/reserve",
+        json={
+            "order_id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            "idempotency_key": "77777777-7777-4777-8777-777777777777",
+            "items": [
+                {"sku_id": sku_id, "quantity": 3},
+                {"sku_id": sku_id, "quantity": 3},
+            ],
+        },
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 409
+    sku = next(sku for product in store.products.values() for sku in product.skus if sku.id == sku_id)
+    assert sku.active_quantity == 5
+    assert sku.reserved_quantity == 0
+
+
 def test_unreserve_restores_quantities():
     sku_id = make_reservable_sku(5)
     reserve_response = client.post(
-        "/api/v1/reserve",
+        "/api/v1/inventory/reserve",
         json={
+            "order_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
             "idempotency_key": "55555555-5555-4555-8555-555555555555",
             "items": [{"sku_id": sku_id, "quantity": 3}],
         },
@@ -496,7 +521,7 @@ def test_unreserve_restores_quantities():
     assert reserve_response.status_code == 200
 
     response = client.post(
-        "/api/v1/unreserve",
+        "/api/v1/inventory/unreserve",
         json={
             "order_id": "66666666-6666-4666-8666-666666666666",
             "items": [{"sku_id": sku_id, "quantity": 3}],
@@ -809,3 +834,33 @@ def test_category_filters_include_dynamic_characteristics():
     response = client.get("/api/v1/categories/" + CATEGORY_ID + "/filters", headers={"X-Service-Key": "development-service-key"})
     assert response.status_code == 200
     assert any(item["name"] == "Brand" for item in response.json()["items"])
+
+
+def test_sku_out_of_stock_event_is_delivered_to_b2c(monkeypatch):
+    sku_id = make_reservable_sku(1)
+    calls: list[dict] = []
+
+    class FakeResponse:
+        status_code = 202
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setenv("B2C_URL", "https://b2c.internal")
+    monkeypatch.setattr("app.main.httpx.post", fake_post)
+    response = client.post(
+        "/api/v1/inventory/reserve",
+        json={
+            "order_id": "12121212-1212-4212-8212-121212121212",
+            "idempotency_key": "13131313-1313-4313-8313-131313131313",
+            "items": [{"sku_id": sku_id, "quantity": 1}],
+        },
+        headers={"X-Service-Key": "development-service-key"},
+    )
+
+    assert response.status_code == 200
+    assert calls[0]["url"] == "https://b2c.internal/api/v1/events/inventory"
+    assert calls[0]["headers"]["X-Service-Key"] == "development-service-key"
+    assert calls[0]["json"]["event_type"] == "SKU_OUT_OF_STOCK"
+    assert calls[0]["json"]["sku_id"] == sku_id
