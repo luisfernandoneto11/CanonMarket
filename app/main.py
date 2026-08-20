@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Callable
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi import Response
@@ -330,9 +330,9 @@ class CartItemResponse(BaseModel):
     available_stock: int
     unit_price: int
     line_total: int
-    product_id: str | None = None
-    product_title: str | None = None
-    sku_name: str | None = None
+    product_id: str
+    product_title: str
+    sku_name: str
     image_url: str | None = None
 
 
@@ -438,13 +438,44 @@ class ProductStore:
                     return product, sku
         return None, None
 
+    def _b2b_snapshot(self, sku_id: str) -> dict[str, Any] | None:
+        """Fetch current product/SKU visibility from B2B for cart reads and writes."""
+        base_url = os.getenv("B2B_URL") or os.getenv("B2B_SERVICE_URL")
+        if not base_url:
+            product, sku = self._find_sku(sku_id)
+            if product is None or sku is None:
+                return None
+            return {"product_id": product.id, "product_title": product.title, "product_status": product.status, "product_deleted": product.deleted, "sku_name": sku.name, "image_url": sku.image, "unit_price": sku.price, "available_stock": sku.active_quantity}
+        headers = {"X-Service-Key": os.getenv("B2C_TO_B2B_KEY", "development-service-key")}
+        try:
+            sku_response = httpx.get(f"{base_url.rstrip('/')}/api/v1/public/skus/{sku_id}", headers=headers, timeout=5.0)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B product service unavailable").model_dump()) from exc
+        if sku_response.status_code == 404:
+            return None
+        if sku_response.status_code != 200:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B product service unavailable").model_dump())
+        sku_data = sku_response.json()
+        product_id = sku_data.get("product_id")
+        try:
+            product_response = httpx.get(f"{base_url.rstrip('/')}/api/v1/public/products/{product_id}", headers=headers, timeout=5.0)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B product service unavailable").model_dump()) from exc
+        if product_response.status_code == 404:
+            return None
+        if product_response.status_code != 200:
+            raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B product service unavailable").model_dump())
+        product_data = product_response.json()
+        matched = next((item for item in product_data.get("skus", []) if item.get("id") == sku_id), sku_data)
+        return {"product_id": product_data.get("id", product_id), "product_title": product_data.get("title"), "product_status": product_data.get("status"), "product_deleted": product_data.get("deleted", False), "sku_name": matched.get("name"), "image_url": matched.get("image"), "unit_price": matched.get("price", 0), "available_stock": matched.get("active_quantity", 0)}
+
     def add_cart_item(self, owner_type: str, owner_id: str, payload: CartAddRequest) -> tuple[dict[str, Any], bool]:
-        product, sku = self._find_sku(payload.sku_id)
-        if product is None or sku is None:
+        snapshot = self._b2b_snapshot(payload.sku_id)
+        if snapshot is None:
             raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="SKU not found").model_dump())
-        if product.status != "MODERATED" or product.deleted or product.blocked:
+        if snapshot["product_status"] != "MODERATED" or snapshot["product_deleted"]:
             raise HTTPException(status_code=409, detail=ApiError(code="SKU_UNAVAILABLE", message="SKU is unavailable").model_dump())
-        if sku.active_quantity < payload.quantity:
+        if snapshot["available_stock"] < payload.quantity:
             raise HTTPException(status_code=409, detail=ApiError(code="OUT_OF_STOCK", message="Insufficient stock").model_dump())
         existing = next((item for item in self.cart_items.values() if item["owner_type"] == owner_type and item["owner_id"] == owner_id and item["sku_id"] == payload.sku_id), None)
         if existing:
@@ -483,32 +514,33 @@ class ProductStore:
             stored_items = [item for item in stored_items if item["id"] in selected_ids]
         issues: list[CartValidationIssue] = []
         for item in stored_items:
-            product, sku = self._find_sku(item["sku_id"])
+            snapshot = self._b2b_snapshot(item["sku_id"])
             issue_type: str | None = None
             message = ""
             details: dict[str, Any] = {"requested": item["quantity"]}
-            if product is None or sku is None or product.deleted:
+            if snapshot is None or snapshot.get("product_deleted"):
                 issue_type = "DELETED"
                 message = "SKU or product was deleted"
-            elif product.status in {"BLOCKED", "HARD_BLOCKED"} or product.blocked:
+            elif snapshot.get("product_status") in {"BLOCKED", "HARD_BLOCKED"}:
                 issue_type = "BLOCKED"
                 message = "Product is blocked"
-            elif product.status == "ON_MODERATION":
+            elif snapshot.get("product_status") == "ON_MODERATION":
                 issue_type = "ON_MODERATION"
                 message = "Product is on moderation"
-            elif sku.active_quantity == 0:
+            elif snapshot.get("available_stock", 0) == 0:
                 issue_type = "OUT_OF_STOCK"
                 message = "SKU is out of stock"
-            elif sku.active_quantity < item["quantity"]:
+            elif snapshot.get("available_stock", 0) < item["quantity"]:
                 issue_type = "INSUFFICIENT_STOCK"
                 message = "Insufficient stock"
-                details["available"] = sku.active_quantity
+                details["available"] = snapshot.get("available_stock", 0)
             if issue_type is not None:
-                issues.append(CartValidationIssue(cart_item_id=item["id"], sku_id=item["sku_id"], issue_type=issue_type, severity="critical", message=message, details=details))
+                severity = "warning" if issue_type in {"INSUFFICIENT_STOCK", "ON_MODERATION"} else "critical"
+                issues.append(CartValidationIssue(cart_item_id=item["id"], sku_id=item["sku_id"], issue_type=issue_type, severity=severity, message=message, details=details))
         total_items = len(stored_items)
         return CartValidationResponse(
             is_valid=not issues,
-            can_checkout=total_items > 0 and not issues,
+            can_checkout=total_items > 0 and not any(issue.severity == "critical" for issue in issues),
             total_items=total_items,
             validation_timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             issues=issues,
@@ -521,27 +553,29 @@ class ProductStore:
         unavailable_count = 0
         checkout_items: list[dict[str, Any]] = []
         for item in self.list_cart(owner_type, owner_id):
-            product, sku = self._find_sku(item["sku_id"])
+            snapshot = self._b2b_snapshot(item["sku_id"])
             reason: str | None = None
             available = True
-            product_id = product.id if product else None
-            product_title = product.title if product else None
-            image = sku.image if sku else None
-            unit_price = sku.price if sku else 0
-            available_stock = sku.active_quantity if sku else 0
-            if product is None or sku is None:
+            product_id = snapshot.get("product_id") if snapshot and snapshot.get("product_id") else item["sku_id"]
+            product_title = snapshot.get("product_title") if snapshot and snapshot.get("product_title") else "Unavailable product"
+            image = snapshot.get("image_url") if snapshot else None
+            unit_price = snapshot.get("unit_price", 0) if snapshot else 0
+            available_stock = snapshot.get("available_stock", 0) if snapshot else 0
+            product_status = snapshot.get("product_status") if snapshot else None
+            product_deleted = snapshot.get("product_deleted", True) if snapshot else True
+            if snapshot is None:
                 available = False
                 reason = "PRODUCT_DELETED"
-            elif product.deleted or product.status == "DELETED":
+            elif product_deleted or product_status == "DELETED":
                 available = False
                 reason = "PRODUCT_DELETED"
-            elif product.status in {"BLOCKED", "HARD_BLOCKED"} or product.blocked:
+            elif product_status in {"BLOCKED", "HARD_BLOCKED"}:
                 available = False
                 reason = "PRODUCT_BLOCKED"
-            elif product.status == "ON_MODERATION":
+            elif product_status == "ON_MODERATION":
                 available = False
                 reason = "ON_MODERATION"
-            elif sku.active_quantity == 0:
+            elif available_stock == 0:
                 available = False
                 reason = "OUT_OF_STOCK"
             line_total = unit_price * item["quantity"] if available else 0
@@ -549,12 +583,14 @@ class ProductStore:
                 unavailable_count += 1
             else:
                 total_amount += line_total
-                if sku.active_quantity < item["quantity"]:
-                    checkout_items.append({"sku_id": item["sku_id"], "quantity": item["quantity"]})
+                checkout_item = {"product_id": product_id, "sku_id": item["sku_id"], "quantity": item["quantity"], "unit_price": unit_price, "line_total": line_total}
+                if available_stock < item["quantity"]:
+                    checkout_items.append(checkout_item)
                 else:
                     total_items += item["quantity"]
-                    checkout_items.append({"sku_id": item["sku_id"], "quantity": item["quantity"]})
-            enriched.append(CartItemResponse(item_id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"], available=available, unavailable_reason=reason, available_stock=available_stock, unit_price=unit_price, line_total=line_total, product_id=product_id, product_title=product_title, sku_name=sku.name if sku else None, image_url=image))
+                    checkout_items.append(checkout_item)
+            enriched.append(CartItemResponse(item_id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"], available=available, unavailable_reason=reason, available_stock=available_stock, unit_price=unit_price, line_total=line_total, product_id=product_id, product_title=product_title,                 sku_name=snapshot.get("sku_name") if snapshot and snapshot.get("sku_name") else "Unavailable SKU", image_url=image))
+
         checkout_ready = unavailable_count == 0 and all(item.available_stock >= item.quantity for item in enriched)
         available_items = sum(1 for item in enriched if item.available)
         total_quantity = sum(item.quantity for item in enriched)
@@ -1071,16 +1107,19 @@ def get_cart(identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -
 
 @app.put(
     "/api/v1/cart/items/{item_id}",
-    response_model=CartStoredItem,
+    response_model=CartMutationResponse,
     responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}},
 )
-def update_cart_item(item_id: str, payload: CartQuantityRequest, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartStoredItem:
-    item = store.owned_cart_item(*identity, item_id)
-    product, sku = store._find_sku(item["sku_id"])
-    if product is None or sku is None or sku.active_quantity < payload.quantity:
-        raise HTTPException(status_code=409, detail=ApiError(code="OUT_OF_STOCK", message="Insufficient stock").model_dump())
+def update_cart_item(item_id: str, payload: CartQuantityRequest, identity: Annotated[tuple[str, str], Depends(get_cart_identity)]) -> CartMutationResponse:
+    owner_type, owner_id = identity
+    item = store.owned_cart_item(owner_type, owner_id, item_id)
+    snapshot = store._b2b_snapshot(item["sku_id"])
+    if snapshot is None or snapshot["product_status"] != "MODERATED" or snapshot["product_deleted"]:
+        raise HTTPException(status_code=410, detail=ApiError(code="PRODUCT_NOT_AVAILABLE", message="Product is unavailable").model_dump())
+    if snapshot["available_stock"] < payload.quantity:
+        raise HTTPException(status_code=422, detail=ApiError(code="INSUFFICIENT_STOCK", message="Insufficient stock").model_dump())
     item["quantity"] = payload.quantity
-    return CartStoredItem(id=item["id"], sku_id=item["sku_id"], quantity=item["quantity"])
+    return store.mutation_response(owner_type, owner_id, item["sku_id"], "Cart item quantity updated successfully")
 
 
 @app.patch(
@@ -1095,9 +1134,11 @@ def patch_cart_item(sku_id: str, payload: CartQuantityRequest, identity: Annotat
         raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="sku_id must be a valid UUID").model_dump()) from None
     owner_type, owner_id = identity
     item = store.cart_item_by_sku(owner_type, owner_id, sku_id)
-    product, sku = store._find_sku(sku_id)
-    if product is None or sku is None or sku.active_quantity < payload.quantity:
-        raise HTTPException(status_code=409, detail=ApiError(code="OUT_OF_STOCK", message="Insufficient stock").model_dump())
+    snapshot = store._b2b_snapshot(sku_id)
+    if snapshot is None or snapshot["product_status"] != "MODERATED" or snapshot["product_deleted"]:
+        raise HTTPException(status_code=410, detail=ApiError(code="PRODUCT_NOT_AVAILABLE", message="Product is unavailable").model_dump())
+    if snapshot["available_stock"] < payload.quantity:
+        raise HTTPException(status_code=422, detail=ApiError(code="INSUFFICIENT_STOCK", message="Insufficient stock").model_dump())
     item["quantity"] = payload.quantity
     return store.mutation_response(owner_type, owner_id, sku_id, "Cart item quantity updated successfully")
 
@@ -1117,10 +1158,22 @@ def delete_cart_item(sku_id: str, identity: Annotated[tuple[str, str], Depends(g
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@app.get(
+    "/cart/validate",
+    response_model=CartValidationResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def validate_cart_get(
+    identity: Annotated[tuple[str, str], Depends(get_cart_identity)],
+    cart_item_ids: list[str] | None = Query(default=None),
+) -> CartValidationResponse:
+    return store.validate_cart(*identity, cart_item_ids)
+
+
 @app.post(
     "/api/v1/cart/validate",
     response_model=CartValidationResponse,
-    responses={400: {"model": ApiError}, 401: {"model": ApiError}},
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 503: {"model": ApiError}},
 )
 def validate_cart(identity: Annotated[tuple[str, str], Depends(get_cart_identity)], payload: CartValidationRequest | None = None) -> CartValidationResponse:
     return store.validate_cart(*identity, payload.cart_item_ids if payload else None)

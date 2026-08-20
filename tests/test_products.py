@@ -724,6 +724,39 @@ def test_cart_contract_patch_delete_by_sku_and_validate():
     assert empty_validation.json()["can_checkout"] is False
 
 
+def test_cart_reads_current_product_data_from_b2b(monkeypatch):
+    sku_id = make_cart_sku(active_quantity=2)
+    headers = {"X-Session-Id": "77777777-7777-4777-8777-777777777777"}
+    assert client.post("/api/v1/cart/items", json={"sku_id": sku_id, "quantity": 1}, headers=headers).status_code == 200
+    monkeypatch.setenv("B2B_URL", "https://b2b.internal")
+
+    class FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    product, sku = store._find_sku(sku_id)
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.endswith(f"/api/v1/public/skus/{sku_id}"):
+            return FakeResponse({"id": sku_id, "product_id": product.id, "name": "B2B name", "price": 777, "discount": 0, "image": "/b2b.jpg", "active_quantity": 4, "characteristics": []})
+        return FakeResponse({"id": product.id, "title": "B2B title", "status": "MODERATED", "deleted": False, "skus": [{"id": sku_id, "name": "B2B name", "price": 777, "image": "/b2b.jpg", "active_quantity": 4, "characteristics": []}]})
+
+    monkeypatch.setattr("app.main.httpx.get", fake_get)
+    response = client.get("/api/v1/cart", headers=headers)
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["product_title"] == "B2B title"
+    assert item["unit_price"] == 777
+    assert item["available_stock"] == 4
+    assert len(calls) == 2
+
+
 def test_cart_validate_reports_insufficient_stock():
     sku_id = make_cart_sku(active_quantity=2)
     headers = {"X-Session-Id": "66666666-6666-4666-8666-666666666666"}
@@ -735,5 +768,6 @@ def test_cart_validate_reports_insufficient_stock():
     assert response.status_code == 200
     body = response.json()
     assert body["is_valid"] is False
-    assert body["can_checkout"] is False
+    assert body["can_checkout"] is True
     assert body["issues"][0]["issue_type"] == "INSUFFICIENT_STOCK"
+    assert body["issues"][0]["severity"] == "warning"
