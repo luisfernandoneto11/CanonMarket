@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -67,6 +68,67 @@ class CreateProductRequest(BaseModel):
         return value
 
 
+class CreateSkuRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str
+    name: str = Field(min_length=1, max_length=255)
+    price: int
+    cost_price: int = 0
+    discount: int = 0
+    article: str | None = Field(default=None, max_length=100)
+    images: list[Image] = Field(default_factory=list)
+    characteristics: list[Characteristic] = Field(default_factory=list)
+
+    @field_validator("product_id")
+    @classmethod
+    def product_id_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("product_id must be a valid UUID") from None
+        return value
+
+    @field_validator("price")
+    @classmethod
+    def price_must_be_positive_integer(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("price must be a positive integer (kopecks)")
+        return value
+
+    @field_validator("cost_price", "discount")
+    @classmethod
+    def money_fields_must_not_be_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("money fields must be non-negative integers (kopecks)")
+        return value
+
+
+class SkuResponse(BaseModel):
+    id: str
+    product_id: str
+    name: str
+    price: int
+    discount: int
+    cost_price: int
+    active_quantity: int
+    reserved_quantity: int
+    article: str
+    images: list[Image]
+    characteristics: list[Characteristic]
+    created_at: str
+    updated_at: str
+
+
+class ModerationEvent(BaseModel):
+    idempotency_key: str
+    product_id: str
+    seller_id: str
+    event_type: str
+    json_after: dict[str, Any]
+    date: str
+
+
 class CategoryRef(BaseModel):
     id: str
     name: str
@@ -95,6 +157,29 @@ class ProductResponse(BaseModel):
 @dataclass
 class ProductStore:
     products: dict[str, ProductResponse] = field(default_factory=dict)
+    moderation_events: list[ModerationEvent] = field(default_factory=list)
+
+    def _publish_sku_event(self, product: ProductResponse, event_type: str, sku: SkuResponse) -> ModerationEvent:
+        event = ModerationEvent(
+            idempotency_key=str(uuid.uuid4()),
+            product_id=product.id,
+            seller_id=product.seller_id,
+            event_type=event_type,
+            json_after=product.model_dump(mode="json"),
+            date=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        self.moderation_events.append(event)
+        moderation_url = os.getenv("MODERATION_URL")
+        if moderation_url:
+            response = httpx.post(
+                f"{moderation_url.rstrip('/')}/api/v1/events/product",
+                headers={"X-Service-Key": os.getenv("B2B_TO_MOD_KEY", "development-service-key")},
+                json=event.model_dump(mode="json"),
+                timeout=5.0,
+            )
+            if response.status_code not in {200, 202}:
+                raise HTTPException(status_code=502, detail=ApiError(code="MODERATION_UNAVAILABLE", message="Moderation service rejected product event").model_dump())
+        return event
 
     def create(self, payload: CreateProductRequest, seller_id: str) -> ProductResponse:
         product_id = str(uuid.uuid4())
@@ -124,6 +209,42 @@ class ProductStore:
         )
         self.products[product_id] = product
         return product
+
+    def add_sku(self, payload: CreateSkuRequest, seller_id: str) -> tuple[SkuResponse, bool]:
+        product = self.products.get(payload.product_id)
+        if product is None:
+            raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump())
+        if product.seller_id != seller_id:
+            raise HTTPException(status_code=403, detail=ApiError(code="NOT_OWNER", message="Product does not belong to the authenticated seller").model_dump())
+        if product.status == "HARD_BLOCKED":
+            raise HTTPException(status_code=403, detail=ApiError(code="FORBIDDEN", message="Cannot add SKU to hard-blocked product").model_dump())
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        sku_id = str(uuid.uuid4())
+        sku = SkuResponse(
+            id=sku_id,
+            product_id=product.id,
+            name=payload.name,
+            price=payload.price,
+            discount=payload.discount,
+            cost_price=payload.cost_price,
+            active_quantity=0,
+            reserved_quantity=0,
+            article=payload.article or f"SKU-{sku_id[:8]}",
+            images=payload.images,
+            characteristics=payload.characteristics,
+            created_at=now,
+            updated_at=now,
+        )
+        is_first = len(product.skus) == 0
+        product.skus.append(sku)
+        if is_first and product.status == "CREATED":
+            product.status = "ON_MODERATION"
+            self._publish_sku_event(product, "PRODUCT_CREATED", sku)
+        elif product.status in {"MODERATED", "BLOCKED"}:
+            product.status = "ON_MODERATION"
+            product.blocked = False
+            self._publish_sku_event(product, "PRODUCT_EDITED", sku)
+        return sku, is_first
 
 
 store = ProductStore()
@@ -200,6 +321,20 @@ def create_product(
             detail=ApiError(code="INVALID_REQUEST", message="Category not found").model_dump(),
         )
     return store.create(payload, seller_id)
+
+
+@app.post(
+    "/api/v1/skus",
+    response_model=SkuResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def create_sku(
+    payload: CreateSkuRequest,
+    seller_id: Annotated[str, Depends(get_seller_id)],
+) -> SkuResponse:
+    sku, _ = store.add_sku(payload, seller_id)
+    return sku
 
 
 @app.get("/health")

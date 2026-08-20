@@ -48,6 +48,51 @@ components:
           items:
             $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
 
+    SKUCreate:
+      type: object
+      required: [product_id, name, price]
+      additionalProperties: false
+      properties:
+        product_id: {type: string, format: uuid}
+        name: {type: string, minLength: 1, maxLength: 255}
+        price: {type: integer, minimum: 1, description: Price in kopecks}
+        cost_price: {type: integer, minimum: 0}
+        discount: {type: integer, minimum: 0}
+        article: {type: string, nullable: true, maxLength: 100}
+        images:
+          type: array
+          default: []
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/Image"
+        characteristics:
+          type: array
+          default: []
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+    SKUResponse:
+      type: object
+      required: [id, product_id, name, price, discount, cost_price, active_quantity, reserved_quantity, article, images, characteristics, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        product_id: {type: string, format: uuid}
+        name: {type: string}
+        price: {type: integer}
+        discount: {type: integer}
+        cost_price: {type: integer}
+        active_quantity: {type: integer, minimum: 0}
+        reserved_quantity: {type: integer, minimum: 0}
+        article: {type: string}
+        images:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/Image"
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
     ProductResponse:
       type: object
       required: [id, seller_id, title, description, status, deleted, blocked, category_id, category, slug, images, characteristics, skus, blocking_reason_id, moderator_comment, created_at, updated_at]
@@ -77,13 +122,38 @@ components:
             $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
         skus:
           type: array
-          items: {}
+          items:
+            $ref: "#/components/schemas/SKUResponse"
         blocking_reason_id: {type: string, format: uuid, nullable: true}
         moderator_comment: {type: string, nullable: true}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
 
 paths:
+  /api/v1/skus:
+    post:
+      summary: Create a product SKU
+      tags: [SKU]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SKUCreate"
+      responses:
+        "201":
+          description: SKU created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SKUResponse"
+        "400": {description: Invalid SKU request}
+        "401": {description: Missing or invalid JWT}
+        "403": {description: Seller does not own the product or product is hard-blocked}
+        "404": {description: Product not found}
+
   /api/v1/products:
     post:
       summary: Создать товар

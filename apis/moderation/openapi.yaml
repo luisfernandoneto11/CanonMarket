@@ -13,6 +13,27 @@ info:
     5. Одобряет или блокирует — и сообщает B2B (формат события — ???)
 
 paths:
+  /api/v1/events/product:
+    post:
+      summary: Receive a B2B product lifecycle event
+      tags: [Events]
+      parameters:
+        - name: X-Service-Key
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EventProductCreated"
+      responses:
+        "202":
+          description: Event accepted
+        "422":
+          description: Event violates the moderation contract
+
   /api/v1/product-moderation/get-next:
     post:
       summary: Следующая карточка из очереди
@@ -82,3 +103,28 @@ paths:
                 items:
                   type: object
                   # Формат — проектируется
+
+components:
+  schemas:
+    EventProductCreated:
+      type: object
+      required: [product_id, seller_id, event_type, json_after]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        seller_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum: [PRODUCT_CREATED, PRODUCT_EDITED, PRODUCT_DELETED]
+        json_after:
+          type: object
+          additionalProperties: true
+        idempotency_key:
+          type: string
+          format: uuid
+        date:
+          type: string
+          format: date-time
