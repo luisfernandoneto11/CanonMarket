@@ -654,8 +654,27 @@ def test_blocked_decision_is_delivered_to_b2c_product_channel(monkeypatch):
     )
     assert response.status_code == 204
     assert calls[0]["url"] == "https://b2c.internal/api/v1/events/product"
-    assert calls[0]["json"]["event_type"] == "PRODUCT_BLOCKED"
-    assert calls[0]["json"]["product_id"] == product_id
+    outbound = calls[0]["json"]
+    assert outbound["event"] == "PRODUCT_BLOCKED"
+    assert outbound["product_id"] == product_id
+    assert outbound["seller_id"] == SELLER_ID
+    assert "sku_ids" in outbound
+    assert "date" in outbound
+    assert "event_type" not in outbound
+    assert "occurred_at" not in outbound
+
+
+def test_moderation_rejects_unsupported_event_type():
+    product_id = create_product()
+    payload = moderation_payload(product_id, "abababab-abab-4bab-8bab-abababababab", "MODERATED")
+    payload["event_type"] = "PRODUCT_DELETED"
+    response = client.post(
+        "/api/v1/moderation/events",
+        json=payload,
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_REQUEST"
 
 
 def test_duplicate_event_same_idempotency_key_no_side_effects():

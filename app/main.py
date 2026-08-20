@@ -9,7 +9,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -296,7 +296,7 @@ class UnreserveResponse(BaseModel):
 class ModerationDecisionRequest(BaseModel):
     idempotency_key: str
     product_id: str
-    event_type: str
+    event_type: Literal["PRODUCT_MODERATED", "PRODUCT_BLOCKED"]
     occurred_at: str
     status: str | None = None
     hard_block: bool = False
@@ -573,10 +573,10 @@ class ProductStore:
                 {
                     "idempotency_key": payload.idempotency_key,
                     "event": "PRODUCT_BLOCKED",
-                    "event_type": "PRODUCT_BLOCKED",
                     "product_id": product.id,
+                    "seller_id": product.seller_id,
                     "sku_ids": [sku.id for sku in product.skus],
-                    "occurred_at": payload.occurred_at,
+                    "date": payload.occurred_at,
                 }
             )
         self.processed_moderation_events.add(payload.idempotency_key)
@@ -610,7 +610,7 @@ class ProductStore:
         b2c_url = os.getenv("B2C_URL") or os.getenv("B2C_EVENT_URL")
         if not b2c_url:
             return
-        event_path = "/api/v1/events/product" if event.get("event_type") == "PRODUCT_BLOCKED" else "/api/v1/events/inventory"
+        event_path = "/api/v1/events/product" if event.get("event") in {"PRODUCT_BLOCKED", "PRODUCT_DELETED"} else "/api/v1/events/inventory"
         response = httpx.post(
             f"{b2c_url.rstrip('/')}{event_path}",
             headers={"X-Service-Key": os.getenv("B2B_TO_B2C_KEY", "development-service-key")},
