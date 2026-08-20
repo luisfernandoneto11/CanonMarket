@@ -58,6 +58,41 @@ paths:
         "204":
           description: Очередь пуста
 
+  /api/v1/tickets/{ticket_id}/approve:
+    post:
+      summary: Approve a moderation ticket
+      tags: [Decisions]
+      security:
+        - bearerHttpAuthentication: []
+      parameters:
+        - name: ticket_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModerationActionRequest'
+      responses:
+        '200':
+          description: Ticket approved and PRODUCT_MODERATED event delivered to B2B.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketResponse'
+        '401':
+          description: Authentication required.
+        '404':
+          description: Ticket not found.
+        '409':
+          description: Ticket is assigned to another moderator or cannot be approved.
+        '503':
+          description: B2B event destination unavailable; ticket remains IN_REVIEW.
+
   /api/v1/products/{id}/approve:
     post:
       summary: Одобрить товар
@@ -148,9 +183,13 @@ components:
     ModerationActionRequest:
       type: object
       properties:
+        comment:
+          type: string
+          maxLength: 2000
         moderator_comment:
           type: string
           maxLength: 1000
+          deprecated: true
     ModerationActionResponse:
       type: object
       required: [product_id, status]
@@ -161,6 +200,31 @@ components:
         status:
           type: string
           enum: [MODERATED]
+    TicketResponse:
+      type: object
+      required: [id, product_id, seller_id, kind, status, queue_priority, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        product_id: {type: string, format: uuid}
+        seller_id: {type: string, format: uuid}
+        kind: {type: string}
+        status: {type: string}
+        queue_priority: {type: integer}
+        created_at: {type: string, format: date-time}
+    ModerationDecisionEvent:
+      type: object
+      required: [idempotency_key, event_type, occurred_at, payload]
+      properties:
+        idempotency_key: {type: string, format: uuid}
+        event_type: {type: string, enum: [PRODUCT_MODERATED, PRODUCT_BLOCKED]}
+        occurred_at: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [product_id, status]
+          properties:
+            product_id: {type: string, format: uuid}
+            status: {type: string, enum: [MODERATED, BLOCKED]}
+            hard_block: {type: boolean}
     ProductEventRequest:
       type: object
       required: [product_id, seller_id, event, date]

@@ -342,12 +342,27 @@ class ModerationDecisionResponse(BaseModel):
 
 
 class ModerationActionRequest(BaseModel):
+    comment: str | None = Field(default=None, max_length=2000)
     moderator_comment: str | None = Field(default=None, max_length=1000)
+
+    @property
+    def effective_comment(self) -> str | None:
+        return self.comment if self.comment is not None else self.moderator_comment
 
 
 class ModerationActionResponse(BaseModel):
     product_id: str
     status: str
+
+
+class TicketResponse(BaseModel):
+    id: str
+    product_id: str
+    seller_id: str
+    kind: str
+    status: str
+    queue_priority: int
+    created_at: str
 
 
 class ProductEventRequest(BaseModel):
@@ -680,24 +695,56 @@ class ProductStore:
         self.processed_moderation_events.add(payload.idempotency_key)
         return ModerationDecisionResponse(ok=True)
 
-    def _emit_moderation_event(self, product: ProductResponse, status_value: str, hard_block: bool = False, blocking_reason: BlockingReason | None = None) -> None:
+    def _emit_moderation_event(self, product: ProductResponse, status_value: str, hard_block: bool = False, blocking_reason: BlockingReason | None = None) -> dict[str, Any]:
         event_key = f"{product.id}:{status_value}:{str(hard_block).lower()}"
-        if any(event.get("event_key") == event_key for event in self.moderation_outgoing_events):
-            return
+        existing = next((event for event in self.moderation_outgoing_events if event.get("event_key") == event_key), None)
+        if existing is not None:
+            return existing
         if os.getenv("B2B_MODERATION_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
             raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
+        occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         event = {
             "event_key": event_key,
             "idempotency_key": str(uuid.uuid5(uuid.NAMESPACE_URL, event_key)),
+            "event_type": "PRODUCT_MODERATED" if status_value == "MODERATED" else "PRODUCT_BLOCKED",
+            "occurred_at": occurred_at,
+            "payload": {
+                "product_id": product.id,
+                "status": status_value,
+                "hard_block": hard_block,
+            },
             "product_id": product.id,
             "status": status_value,
             "hard_block": hard_block,
         }
         if blocking_reason is not None:
             event["blocking_reason"] = blocking_reason.model_dump()
+            event["payload"]["blocking_reason"] = blocking_reason.model_dump()
+        b2b_url = os.getenv("B2B_URL") or os.getenv("B2B_MODERATION_URL")
+        if b2b_url:
+            response = httpx.post(
+                f"{b2b_url.rstrip('/')}/api/v1/moderation/events",
+                headers={"X-Service-Key": os.getenv("MOD_TO_B2B_KEY", "development-service-key")},
+                json=event,
+                timeout=5.0,
+            )
+            if response.status_code not in {200, 202, 204}:
+                raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
         self.moderation_outgoing_events.append(event)
+        return event
 
-    def approve_product(self, product_id: str, moderator_id: str, comment: str | None = None) -> ModerationActionResponse:
+    def _ticket_response(self, product: ProductResponse) -> TicketResponse:
+        return TicketResponse(
+            id=product.id,
+            product_id=product.id,
+            seller_id=product.seller_id,
+            kind="PRODUCT_MODERATION",
+            status=product.status,
+            queue_priority=0,
+            created_at=getattr(product, "created_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+        )
+
+    def approve_product(self, product_id: str, moderator_id: str, comment: str | None = None) -> TicketResponse:
         product = self.products.get(product_id)
         if product is None:
             raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump())
@@ -706,7 +753,7 @@ class ProductStore:
         if product.status != "IN_REVIEW":
             raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product is not in review status").model_dump())
         if self.moderator_assignments.get(product_id) != moderator_id:
-            raise HTTPException(status_code=403, detail=ApiError(code="FORBIDDEN", message="This moderation card is not assigned to you").model_dump())
+            raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="This moderation card is assigned to another moderator").model_dump())
         if not product.skus:
             raise HTTPException(status_code=409, detail=ApiError(code="CONFLICT", message="Product has no SKUs, cannot approve").model_dump())
         self._emit_moderation_event(product, "MODERATED")
@@ -715,7 +762,7 @@ class ProductStore:
         product.blocking_reason = None
         product.field_reports = []
         self.moderator_assignments.pop(product_id, None)
-        return ModerationActionResponse(product_id=product.id, status=product.status)
+        return self._ticket_response(product)
 
     def apply_product_event(self, payload: ProductEventRequest) -> ProductEventResponse:
         product = self.products.get(payload.product_id)
@@ -1559,6 +1606,23 @@ def _valid_moderation_service_key(value: str | None) -> bool:
 
 
 @app.post(
+    "/api/v1/tickets/{ticket_id}/approve",
+    response_model=TicketResponse,
+    responses={401: {"model": ApiError}, 409: {"model": ApiError}, 404: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def approve_ticket(
+    ticket_id: str,
+    moderator_id: Annotated[str, Depends(get_moderator_id)],
+    payload: ModerationActionRequest | None = None,
+) -> TicketResponse:
+    try:
+        uuid.UUID(ticket_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Ticket not found").model_dump()) from None
+    return store.approve_product(ticket_id, moderator_id, payload.effective_comment if payload else None)
+
+
+@app.post(
     "/api/v1/products/{product_id}/approve",
     response_model=ModerationActionResponse,
     responses={401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}, 503: {"model": ApiError}},
@@ -1572,7 +1636,8 @@ def approve_product(
         uuid.UUID(product_id)
     except ValueError:
         raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump()) from None
-    return store.approve_product(product_id, moderator_id, payload.moderator_comment if payload else None)
+    ticket = store.approve_product(product_id, moderator_id, payload.effective_comment if payload else None)
+    return ModerationActionResponse(product_id=ticket.product_id, status=ticket.status)
 
 
 @app.post(

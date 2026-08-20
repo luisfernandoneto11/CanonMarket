@@ -1042,7 +1042,7 @@ def test_approve_transitions_to_moderated_and_emits_event():
     assert store.moderation_outgoing_events[-1]["hard_block"] is False
 
 
-def test_approve_others_card_returns_403():
+def test_approve_others_card_returns_409():
     product_id = make_review_product()
     store.moderator_assignments[product_id] = MODERATOR_ID
 
@@ -1051,8 +1051,56 @@ def test_approve_others_card_returns_403():
         headers={"Authorization": f"Bearer {moderator_jwt(OTHER_MODERATOR_ID)}"},
     )
 
-    assert response.status_code == 403
+    assert response.status_code == 409
     assert store.products[product_id].status == "IN_REVIEW"
+
+
+def test_ticket_approve_returns_complete_ticket_response():
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+
+    response = client.post(
+        f"/api/v1/tickets/{product_id}/approve",
+        json={"comment": "Card verified"},
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == product_id
+    assert body["product_id"] == product_id
+    assert body["seller_id"]
+    assert body["kind"] == "PRODUCT_MODERATION"
+    assert body["status"] == "MODERATED"
+    assert "queue_priority" in body
+    assert body["created_at"]
+
+
+def test_approval_event_is_delivered_to_b2b(monkeypatch):
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+    calls: list[dict] = []
+
+    class FakeResponse:
+        status_code = 204
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setenv("B2B_URL", "https://b2b.internal")
+    monkeypatch.setattr("app.main.httpx.post", fake_post)
+    response = client.post(
+        f"/api/v1/tickets/{product_id}/approve",
+        json={"comment": "Approved"},
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 200
+    assert calls[0]["url"] == "https://b2b.internal/api/v1/moderation/events"
+    assert calls[0]["json"]["event_type"] == "PRODUCT_MODERATED"
+    assert calls[0]["json"]["occurred_at"]
+    assert calls[0]["json"]["payload"]["product_id"] == product_id
 
 
 def test_approve_after_edited_returns_409():
