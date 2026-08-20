@@ -18,6 +18,12 @@ paths:
           required: true
           schema:
             type: string
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -80,9 +86,12 @@ components:
           minimum: 1
     OrderCreateRequest:
       type: object
-      required: [idempotency_key, items]
+      required: [items, address_id, payment_method_id]
       properties:
-        idempotency_key:
+        address_id:
+          type: string
+          format: uuid
+        payment_method_id:
           type: string
           format: uuid
         items:
@@ -117,7 +126,7 @@ components:
           type: integer
     Order:
       type: object
-      required: [id, user_id, status, total_amount, idempotency_key, items]
+      required: [id, user_id, buyer_id, status, subtotal, total, address, created_at, items]
       properties:
         id:
           type: string
@@ -125,11 +134,24 @@ components:
         user_id:
           type: string
           format: uuid
+        buyer_id:
+          type: string
+          format: uuid
         status:
           type: string
           enum: [PAID]
+        subtotal:
+          type: integer
+        total:
+          type: integer
         total_amount:
           type: integer
+        address:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
         idempotency_key:
           type: string
           format: uuid

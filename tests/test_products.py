@@ -872,8 +872,8 @@ def test_checkout_creates_paid_order_with_fixed_prices():
 
     response = client.post(
         "/api/v1/orders",
-        json={"idempotency_key": key, "items": [{"sku_id": sku_id, "quantity": 2}]},
-        headers=headers,
+        json={"address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 2}]},
+        headers={**headers, "Idempotency-Key": key},
     )
 
     assert response.status_code == 201
@@ -883,6 +883,11 @@ def test_checkout_creates_paid_order_with_fixed_prices():
     assert order["items"][0]["product_title"] == product.title
     assert order["items"][0]["sku_name"] == product.skus[0].name
     assert order["total_amount"] == 25998000
+    assert order["buyer_id"] == USER_ID
+    assert order["subtotal"] == 25998000
+    assert order["total"] == 25998000
+    assert order["address"] == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    assert order["created_at"]
     assert product.skus[0].active_quantity == 3
     product.skus[0].price = 999
     assert store.orders[order["id"]].items[0].unit_price == 12999000
@@ -894,10 +899,11 @@ def test_partial_reserve_failure_returns_409():
     response = client.post(
         "/api/v1/orders",
         json={
-            "idempotency_key": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
             "items": [{"sku_id": first_sku, "quantity": 2}, {"sku_id": second_sku, "quantity": 1}],
         },
-        headers={"Authorization": f"Bearer {cart_jwt()}"},
+        headers={"Authorization": f"Bearer {cart_jwt()}", "Idempotency-Key": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
     )
 
     assert response.status_code == 409
@@ -909,10 +915,11 @@ def test_partial_reserve_failure_returns_409():
 def test_idempotency_returns_existing_order():
     sku_id = make_cart_sku(5)
     headers = {"Authorization": f"Bearer {cart_jwt()}"}
-    payload = {"idempotency_key": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 1}]}
+    payload = {"address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 1}]}
+    checkout_headers = {**headers, "Idempotency-Key": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"}
 
-    first = client.post("/api/v1/orders", json=payload, headers=headers)
-    second = client.post("/api/v1/orders", json=payload, headers=headers)
+    first = client.post("/api/v1/orders", json=payload, headers=checkout_headers)
+    second = client.post("/api/v1/orders", json=payload, headers=checkout_headers)
 
     assert first.status_code == 201
     assert second.status_code == 200
@@ -925,8 +932,58 @@ def test_b2b_unavailable_returns_503(monkeypatch):
     monkeypatch.setenv("B2B_CHECKOUT_UNAVAILABLE", "1")
     response = client.post(
         "/api/v1/orders",
-        json={"idempotency_key": "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "items": [{"sku_id": sku_id, "quantity": 1}]},
-        headers={"Authorization": f"Bearer {cart_jwt()}"},
+        json={"address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "items": [{"sku_id": sku_id, "quantity": 1}]},
+        headers={"Authorization": f"Bearer {cart_jwt()}", "Idempotency-Key": "ffffffff-ffff-4fff-8fff-ffffffffffff"},
     )
     assert response.status_code == 503
     assert response.json() == {"code": "B2B_UNAVAILABLE", "message": "Product service temporarily unavailable"}
+
+
+def test_checkout_requires_idempotency_header():
+    sku_id = make_cart_sku(1)
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "items": [{"sku_id": sku_id, "quantity": 1}],
+        },
+        headers={"Authorization": f"Bearer {cart_jwt()}"},
+    )
+    assert response.status_code == 400
+    assert response.json() == {"code": "MISSING_IDEMPOTENCY_KEY", "message": "Idempotency-Key header is required"}
+
+
+def test_checkout_reserves_through_b2b_inventory_endpoint(monkeypatch):
+    sku_id = make_cart_sku(1)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"reserved": True, "items": [], "failed_items": []}
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setenv("B2B_URL", "http://b2b.test")
+    monkeypatch.setattr("app.main.httpx.post", fake_post)
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "address_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "payment_method_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "items": [{"sku_id": sku_id, "quantity": 1}],
+        },
+        headers={
+            "Authorization": f"Bearer {cart_jwt()}",
+            "Idempotency-Key": "99999999-9999-4999-8999-999999999999",
+        },
+    )
+    assert response.status_code == 201
+    assert calls[0][0] == "http://b2b.test/api/v1/inventory/reserve"
+    assert calls[0][1]["json"]["order_id"] == response.json()["id"]
+    assert calls[0][1]["json"]["items"][0]["sku_id"] == sku_id
