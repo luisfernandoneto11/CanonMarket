@@ -537,7 +537,14 @@ def test_unreserve_restores_quantities():
 
 
 def moderation_payload(product_id: str, key: str, status: str = "MODERATED", hard_block: bool = False) -> dict:
-    payload = {"idempotency_key": key, "product_id": product_id, "status": status, "hard_block": hard_block}
+    payload = {
+        "idempotency_key": key,
+        "product_id": product_id,
+        "event_type": "PRODUCT_MODERATED" if status == "MODERATED" else "PRODUCT_BLOCKED",
+        "occurred_at": "2026-08-20T00:00:00Z",
+        "status": status,
+        "hard_block": hard_block,
+    }
     if status == "BLOCKED":
         payload["blocking_reason"] = {
             "id": "a7b8c9d0-1234-5678-ef01-890123456789",
@@ -598,6 +605,18 @@ def test_blocked_hard_sets_terminal_status():
     assert store.b2c_events[-1]["event"] == "PRODUCT_BLOCKED"
 
 
+def test_canonical_moderation_event_returns_204_and_applies_decision():
+    product_id = create_product()
+    response = client.post(
+        "/api/v1/moderation/events",
+        json=moderation_payload(product_id, "12121212-1212-4212-8212-121212121212", "MODERATED"),
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 204
+    assert response.content == b""
+    assert store.products[product_id].status == "MODERATED"
+
+
 def test_hard_blocked_product_rejects_seller_edits():
     product_id = create_product(status="HARD_BLOCKED")
 
@@ -613,6 +632,30 @@ def test_hard_blocked_product_rejects_seller_edits():
 
     assert update.status_code == 403
     assert delete.status_code == 403
+
+
+def test_blocked_decision_is_delivered_to_b2c_product_channel(monkeypatch):
+    product_id = create_product()
+    calls: list[dict] = []
+
+    class FakeResponse:
+        status_code = 202
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setenv("B2C_URL", "https://b2c.internal")
+    monkeypatch.setattr("app.main.httpx.post", fake_post)
+    response = client.post(
+        "/api/v1/moderation/events",
+        json=moderation_payload(product_id, "13131313-1313-4313-8313-131313131313", "BLOCKED"),
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 204
+    assert calls[0]["url"] == "https://b2c.internal/api/v1/events/product"
+    assert calls[0]["json"]["event_type"] == "PRODUCT_BLOCKED"
+    assert calls[0]["json"]["product_id"] == product_id
 
 
 def test_duplicate_event_same_idempotency_key_no_side_effects():

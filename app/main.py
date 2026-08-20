@@ -296,7 +296,9 @@ class UnreserveResponse(BaseModel):
 class ModerationDecisionRequest(BaseModel):
     idempotency_key: str
     product_id: str
-    status: str
+    event_type: str
+    occurred_at: str
+    status: str | None = None
     hard_block: bool = False
     blocking_reason: BlockingReason | None = None
     field_reports: list[FieldReport] = Field(default_factory=list)
@@ -310,11 +312,20 @@ class ModerationDecisionRequest(BaseModel):
             raise ValueError("identifier must be a valid UUID") from None
         return value
 
-    @field_validator("status")
+    @field_validator("event_type")
     @classmethod
-    def status_must_be_supported(cls, value: str) -> str:
-        if value not in {"MODERATED", "BLOCKED"}:
-            raise ValueError("status must be MODERATED or BLOCKED")
+    def event_type_must_be_supported(cls, value: str) -> str:
+        if value not in {"PRODUCT_MODERATED", "PRODUCT_BLOCKED"}:
+            raise ValueError("event_type must be PRODUCT_MODERATED or PRODUCT_BLOCKED")
+        return value
+
+    @field_validator("occurred_at")
+    @classmethod
+    def occurred_at_must_be_datetime(cls, value: str) -> str:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("occurred_at must be an ISO-8601 datetime") from None
         return value
 
 
@@ -547,7 +558,8 @@ class ProductStore:
                 detail=ApiError(code="NOT_FOUND", message="Product not found").model_dump(),
             )
 
-        if payload.status == "MODERATED":
+        decision_status = "MODERATED" if payload.event_type == "PRODUCT_MODERATED" else "BLOCKED"
+        if decision_status == "MODERATED":
             product.status = "MODERATED"
             product.blocked = False
             product.blocking_reason = None
@@ -557,13 +569,14 @@ class ProductStore:
             product.blocked = True
             product.blocking_reason = payload.blocking_reason
             product.field_reports = payload.field_reports
-            self.b2c_events.append(
+            self._publish_b2c_event(
                 {
-                    "idempotency_key": str(uuid.uuid4()),
+                    "idempotency_key": payload.idempotency_key,
                     "event": "PRODUCT_BLOCKED",
+                    "event_type": "PRODUCT_BLOCKED",
                     "product_id": product.id,
                     "sku_ids": [sku.id for sku in product.skus],
-                    "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "occurred_at": payload.occurred_at,
                 }
             )
         self.processed_moderation_events.add(payload.idempotency_key)
@@ -597,8 +610,9 @@ class ProductStore:
         b2c_url = os.getenv("B2C_URL") or os.getenv("B2C_EVENT_URL")
         if not b2c_url:
             return
+        event_path = "/api/v1/events/product" if event.get("event_type") == "PRODUCT_BLOCKED" else "/api/v1/events/inventory"
         response = httpx.post(
-            f"{b2c_url.rstrip('/')}/api/v1/events/inventory",
+            f"{b2c_url.rstrip('/')}{event_path}",
             headers={"X-Service-Key": os.getenv("B2B_TO_B2C_KEY", "development-service-key")},
             json=event,
             timeout=5.0,
@@ -1213,6 +1227,25 @@ def merge_guest_cart(
 def _valid_moderation_service_key(value: str | None) -> bool:
     expected = os.getenv("MOD_TO_B2B_KEY", "development-service-key")
     return value is not None and value == expected
+
+
+@app.post(
+    "/api/v1/moderation/events",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}},
+)
+def apply_moderation_event_contract(
+    payload: ModerationDecisionRequest,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> Response:
+    if not _valid_moderation_service_key(x_service_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump(),
+        )
+    store.apply_moderation(payload)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post(

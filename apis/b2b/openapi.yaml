@@ -335,7 +335,7 @@ components:
             $ref: "#/components/schemas/ReserveItem"
     ModerationDecisionRequest:
       type: object
-      required: [idempotency_key, product_id, status]
+      required: [idempotency_key, product_id, event_type, occurred_at]
       properties:
         idempotency_key:
           type: string
@@ -343,9 +343,16 @@ components:
         product_id:
           type: string
           format: uuid
+        event_type:
+          type: string
+          enum: [PRODUCT_MODERATED, PRODUCT_BLOCKED]
+        occurred_at:
+          type: string
+          format: date-time
         status:
           type: string
           enum: [MODERATED, BLOCKED]
+          deprecated: true
         hard_block:
           type: boolean
           default: false
@@ -625,7 +632,7 @@ paths:
         "409":
           description: Reserved quantity is insufficient
 
-  /api/v1/events/moderation:
+  /api/v1/moderation/events:
     post:
       summary: Apply a moderation decision to a product
       tags: [Moderation]
@@ -638,16 +645,8 @@ paths:
             schema:
               $ref: "#/components/schemas/ModerationDecisionRequest"
       responses:
-        "200":
+        "204":
           description: Decision accepted; duplicate idempotency keys are no-ops
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [ok]
-                properties:
-                  ok:
-                    type: boolean
         "401":
           description: X-Service-Key ausente ou inválido
         "404":
