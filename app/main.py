@@ -352,9 +352,43 @@ class ModerationActionResponse(BaseModel):
 
 class ModerationDeclineRequest(BaseModel):
     blocking_reason: BlockingReason
+    comment: str | None = Field(default=None, max_length=2000)
     moderator_comment: str | None = Field(default=None, max_length=1000)
     field_reports: list[FieldReport] = Field(default_factory=list)
     hard_block: bool = False
+
+
+class TicketResponse(BaseModel):
+    id: str
+    product_id: str
+    seller_id: str
+    kind: str
+    status: str
+    queue_priority: int
+    created_at: str
+
+
+class B2BProductEventRequest(BaseModel):
+    idempotency_key: str
+    event_type: str
+    occurred_at: str
+    payload: dict[str, Any]
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def event_key_must_be_uuid(cls, value: str) -> str:
+        try:
+            uuid.UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError("idempotency_key must be a valid UUID") from None
+        return value
+
+    @field_validator("event_type")
+    @classmethod
+    def event_type_must_be_supported(cls, value: str) -> str:
+        if value not in {"PRODUCT_CREATED", "PRODUCT_EDITED", "PRODUCT_DELETED"}:
+            raise ValueError("unsupported B2B event type")
+        return value
 
 
 class ProductEventRequest(BaseModel):
@@ -693,15 +727,34 @@ class ProductStore:
             return
         if os.getenv("B2B_MODERATION_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
             raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
+        occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         event = {
             "event_key": event_key,
             "idempotency_key": str(uuid.uuid5(uuid.NAMESPACE_URL, event_key)),
+            "event_type": "PRODUCT_BLOCKED" if status_value == "BLOCKED" else "PRODUCT_MODERATED",
+            "occurred_at": occurred_at,
+            "payload": {
+                "product_id": product.id,
+                "status": status_value,
+                "hard_block": hard_block,
+            },
             "product_id": product.id,
             "status": status_value,
             "hard_block": hard_block,
         }
         if blocking_reason is not None:
             event["blocking_reason"] = blocking_reason.model_dump()
+            event["payload"]["blocking_reason"] = blocking_reason.model_dump()
+        b2b_url = os.getenv("B2B_URL") or os.getenv("B2B_MODERATION_URL")
+        if b2b_url:
+            response = httpx.post(
+                f"{b2b_url.rstrip('/')}/api/v1/moderation/events",
+                headers={"X-Service-Key": os.getenv("MOD_TO_B2B_KEY", "development-service-key")},
+                json=event,
+                timeout=5.0,
+            )
+            if response.status_code not in {200, 202, 204}:
+                raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
         self.moderation_outgoing_events.append(event)
 
     def approve_product(self, product_id: str, moderator_id: str, comment: str | None = None) -> ModerationActionResponse:
@@ -1603,6 +1656,35 @@ def approve_product(
 
 
 @app.post(
+    "/api/v1/tickets/{ticket_id}/block",
+    response_model=TicketResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}, 503: {"model": ApiError}},
+)
+def block_ticket(
+    ticket_id: str,
+    moderator_id: Annotated[str, Depends(get_moderator_id)],
+    payload: ModerationDeclineRequest,
+) -> TicketResponse:
+    try:
+        uuid.UUID(ticket_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Ticket not found").model_dump()) from None
+    if not payload.hard_block:
+        raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="hard_block must be true").model_dump())
+    result = store.hard_block_product(ticket_id, moderator_id, payload)
+    product = store.products[ticket_id]
+    return TicketResponse(
+        id=ticket_id,
+        product_id=product.id,
+        seller_id=product.seller_id,
+        kind="PRODUCT_MODERATION",
+        status=result.status,
+        queue_priority=0,
+        created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+
+
+@app.post(
     "/api/v1/products/{product_id}/decline",
     response_model=ModerationActionResponse,
     responses={400: {"model": ApiError}, 401: {"model": ApiError}, 403: {"model": ApiError}, 404: {"model": ApiError}, 409: {"model": ApiError}, 503: {"model": ApiError}},
@@ -1619,6 +1701,26 @@ def decline_product(
     if not payload.hard_block:
         raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="Only hard_block=true is implemented in this task").model_dump())
     return store.hard_block_product(product_id, moderator_id, payload)
+
+
+@app.post(
+    "/api/v1/b2b/events",
+    response_model=ProductEventResponse,
+    responses={400: {"model": ApiError}, 401: {"model": ApiError}},
+)
+def apply_b2b_event(
+    payload: B2BProductEventRequest,
+    x_service_key: Annotated[str | None, Header()] = None,
+) -> ProductEventResponse:
+    expected = os.getenv("B2B_TO_MOD_KEY", "development-service-key")
+    if x_service_key != expected:
+        raise HTTPException(status_code=401, detail=ApiError(code="UNAUTHORIZED", message="Valid X-Service-Key is required").model_dump())
+    product_id = payload.payload.get("product_id")
+    if not product_id:
+        raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="payload.product_id is required").model_dump())
+    seller_id = payload.payload.get("seller_id") or (store.products.get(product_id).seller_id if store.products.get(product_id) else str(uuid.uuid4()))
+    event = payload.event_type.replace("PRODUCT_", "")
+    return store.apply_product_event(ProductEventRequest(product_id=product_id, seller_id=seller_id, event=event, date=payload.occurred_at))
 
 
 @app.post(

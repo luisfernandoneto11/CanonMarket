@@ -1170,3 +1170,60 @@ def test_deleted_event_removes_hard_blocked():
     assert store.products[product_id].deleted is True
     assert store.products[product_id].blocked is True
     assert store.products[product_id].status == "DELETED"
+
+
+def test_ticket_block_returns_complete_response_and_delivers_b2b(monkeypatch):
+    product_id = make_review_product()
+    store.moderator_assignments[product_id] = MODERATOR_ID
+    calls: list[dict] = []
+
+    class FakeResponse:
+        status_code = 204
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setenv("B2B_URL", "https://b2b.internal")
+    monkeypatch.setattr("app.main.httpx.post", fake_post)
+    response = client.post(
+        f"/api/v1/tickets/{product_id}/block",
+        json={
+            "hard_block": True,
+            "comment": "Terminal prohibition",
+            "blocking_reason": {
+                "id": "d0e1f2a3-4567-8901-2345-678901234567",
+                "title": "Prohibited product",
+                "comment": "Cannot be sold",
+            },
+            "field_reports": [],
+        },
+        headers={"Authorization": f"Bearer {moderator_jwt()}"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == product_id
+    assert body["product_id"] == product_id
+    assert body["status"] == "HARD_BLOCKED"
+    assert calls[0]["url"] == "https://b2b.internal/api/v1/moderation/events"
+    assert calls[0]["json"]["event_type"] == "PRODUCT_BLOCKED"
+    assert calls[0]["json"]["payload"]["hard_block"] is True
+    assert calls[0]["json"]["payload"]["status"] == "BLOCKED"
+
+
+def test_b2b_wrapped_edited_event_is_ignored_after_hard_block():
+    product_id = create_product(status="HARD_BLOCKED")
+    response = client.post(
+        "/api/v1/b2b/events",
+        json={
+            "idempotency_key": "14141414-1414-4414-8414-141414141414",
+            "event_type": "PRODUCT_EDITED",
+            "occurred_at": "2026-08-20T00:00:00Z",
+            "payload": {"product_id": product_id, "seller_id": SELLER_ID},
+        },
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 200
+    assert response.json()["ignored"] is True
+    assert store.products[product_id].status == "HARD_BLOCKED"

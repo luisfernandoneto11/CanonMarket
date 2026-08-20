@@ -95,6 +95,58 @@ paths:
         '503':
           description: B2B event destination unavailable; card remains IN_REVIEW.
 
+  /api/v1/tickets/{ticket_id}/block:
+    post:
+      summary: Apply irreversible HARD_BLOCKED decision to a ticket
+      tags: [Decisions]
+      security:
+        - bearerHttpAuthentication: []
+      parameters:
+        - name: ticket_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModerationDeclineRequest'
+      responses:
+        '200':
+          description: Ticket hard blocked and BLOCKED event delivered to B2B.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketResponse'
+        '400': {description: hard_block must be true}
+        '401': {description: Authentication required}
+        '404': {description: Ticket not found}
+        '409': {description: Ticket is not in review, terminal, or assigned to another moderator}
+        '503': {description: B2B event destination unavailable}
+
+  /api/v1/b2b/events:
+    post:
+      summary: Receive product events from B2B
+      tags: [Events]
+      security:
+        - serviceKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/B2BProductEventRequest'
+      responses:
+        '200':
+          description: Event accepted or ignored idempotently.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductEventResponse'
+        '400': {description: Invalid B2B event}
+        '401': {description: Invalid service key}
+
   /api/v1/products/{id}/decline:
     post:
       summary: Block a product; hard_block=true creates terminal HARD_BLOCKED status
@@ -201,15 +253,43 @@ components:
         ignored:
           type: boolean
           default: false
+    TicketResponse:
+      type: object
+      required: [id, product_id, seller_id, kind, status, queue_priority, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        product_id: {type: string, format: uuid}
+        seller_id: {type: string, format: uuid}
+        kind: {type: string}
+        status: {type: string}
+        queue_priority: {type: integer}
+        created_at: {type: string, format: date-time}
+    B2BProductEventRequest:
+      type: object
+      required: [idempotency_key, event_type, occurred_at, payload]
+      properties:
+        idempotency_key: {type: string, format: uuid}
+        event_type: {type: string, enum: [PRODUCT_CREATED, PRODUCT_EDITED, PRODUCT_DELETED]}
+        occurred_at: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [product_id]
+          properties:
+            product_id: {type: string, format: uuid}
+            seller_id: {type: string, format: uuid}
     ModerationDeclineRequest:
       type: object
       required: [blocking_reason, hard_block]
       properties:
         blocking_reason:
           $ref: '#/components/schemas/BlockingReason'
+        comment:
+          type: string
+          maxLength: 2000
         moderator_comment:
           type: string
           maxLength: 1000
+          deprecated: true
         field_reports:
           type: array
           items:
