@@ -877,3 +877,51 @@ def test_public_catalog_paths_require_service_key():
     assert client.post("/api/v1/public/products/batch", json={"ids": ["a1b2c3d4-e5f6-7890-abcd-ef1234567890"]}).status_code == 401
     assert client.get("/api/v1/public/products/a1b2c3d4-e5f6-7890-abcd-ef1234567890").status_code == 401
     assert client.get("/api/v1/public/skus/a1b2c3d4-e5f6-7890-abcd-ef1234567890").status_code == 401
+
+
+def test_public_catalog_projection_matches_b2b_catalog_product_schema():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.get(
+        "/api/v1/public/products", headers={"X-Service-Key": "development-service-key"}
+    )
+    assert response.status_code == 200
+    item = next(item for item in response.json()["items"] if item["id"] == product_id)
+    assert set(item) == {"id", "title", "description", "status", "category", "images", "characteristics", "skus"}
+    assert set(item["skus"][0]) == {"id", "product_id", "name", "price", "discount", "image", "active_quantity", "characteristics"}
+
+
+def test_public_catalog_batch_uses_ids_body_and_catalog_response():
+    product_id = make_moderated_product(active_quantity=5)
+    response = client.post(
+        "/api/v1/public/products/batch",
+        json={"ids": [product_id]},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"items", "total_count", "limit", "offset"}
+    assert [item["id"] for item in body["items"]] == [product_id]
+    assert body["total_count"] == 1
+
+
+def test_public_catalog_batch_rejects_non_uuid_ids_with_contract_error():
+    response = client.post(
+        "/api/v1/public/products/batch",
+        json={"ids": ["not-a-uuid"]},
+        headers={"X-Service-Key": "development-service-key"},
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_REQUEST"
+
+
+def test_public_sku_detail_matches_public_sku_schema():
+    product_id = make_moderated_product(active_quantity=5)
+    sku_id = store.products[product_id].skus[0].id
+    response = client.get(
+        f"/api/v1/public/skus/{sku_id}", headers={"X-Service-Key": "development-service-key"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"id", "product_id", "name", "price", "discount", "image", "active_quantity", "characteristics"}
+    assert "cost_price" not in body
+    assert "reserved_quantity" not in body

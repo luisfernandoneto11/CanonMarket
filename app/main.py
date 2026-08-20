@@ -35,17 +35,19 @@ class ApiError(BaseModel):
 
 
 class Image(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Shared B2B image properties are optional and must remain permissive.
+    model_config = ConfigDict(extra="ignore")
 
-    url: str = Field(min_length=1)
-    ordering: int = Field(ge=0)
+    url: str = ""
+    ordering: int = 0
 
 
 class Characteristic(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Shared B2B characteristic properties are optional.
+    model_config = ConfigDict(extra="ignore")
 
-    name: str = Field(min_length=1)
-    value: str = Field(min_length=1)
+    name: str = ""
+    value: str = ""
 
 
 class CreateProductRequest(BaseModel):
@@ -168,6 +170,7 @@ class PublicSkuResponse(BaseModel):
 
 
 class CatalogProductResponse(BaseModel):
+    # Exact projection of the B2B CatalogProduct schema.
     id: str
     title: str
     description: str
@@ -176,10 +179,6 @@ class CatalogProductResponse(BaseModel):
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[PublicSkuResponse]
-    image: str | None = None
-    price: int | None = None
-    in_stock: bool = True
-    is_in_cart: bool = False
 
 
 class CatalogResponse(BaseModel):
@@ -190,7 +189,19 @@ class CatalogResponse(BaseModel):
 
 
 class PublicBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     ids: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("ids")
+    @classmethod
+    def ids_must_be_uuids(cls, values: list[str]) -> list[str]:
+        for value in values:
+            try:
+                uuid.UUID(value)
+            except (ValueError, AttributeError):
+                raise ValueError("ids must contain valid UUIDs") from None
+        return values
 
 
 class FacetValue(BaseModel):
@@ -797,9 +808,6 @@ def _to_catalog_product(product: ProductResponse) -> CatalogProductResponse:
             )
             for sku in visible_skus
         ],
-        image=product.images[0].url if product.images else None,
-        price=cheapest.price,
-        in_stock=True,
     )
 
 
