@@ -25,7 +25,7 @@ components:
           example: At least one image is required
     CreateProductRequest:
       type: object
-      required: [title, description, category_id, images]
+      required: [title, description, category_id]
       properties:
         title:
           type: string
@@ -40,13 +40,48 @@ components:
           format: uuid
         images:
           type: array
-          minItems: 1
+          default: []
           items:
             $ref: "../shared/schemas.yaml#/components/schemas/Image"
         characteristics:
           type: array
           items:
             $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+
+    ProductResponse:
+      type: object
+      required: [id, seller_id, title, description, status, deleted, blocked, category_id, category, slug, images, characteristics, skus, blocking_reason_id, moderator_comment, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        seller_id: {type: string, format: uuid}
+        title: {type: string}
+        description: {type: string}
+        status: {type: string, enum: [CREATED, ON_MODERATION, MODERATED, BLOCKED, HARD_BLOCKED, DELETED]}
+        deleted: {type: boolean}
+        blocked: {type: boolean}
+        category_id: {type: string, format: uuid}
+        category:
+          type: object
+          required: [id, name]
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+        slug: {type: string}
+        images:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/Image"
+        characteristics:
+          type: array
+          items:
+            $ref: "../shared/schemas.yaml#/components/schemas/CharacteristicValue"
+        skus:
+          type: array
+          items: {}
+        blocking_reason_id: {type: string, format: uuid, nullable: true}
+        moderator_comment: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
 
 paths:
   /api/v1/products:
@@ -67,7 +102,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "../shared/schemas.yaml#/components/schemas/Product"
+                $ref: "#/components/schemas/ProductResponse"
         "400":
           description: Некорректные данные товара или неизвестная категория
           content:

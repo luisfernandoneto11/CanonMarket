@@ -6,7 +6,9 @@ import base64
 import binascii
 import json
 import os
+import re
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -52,7 +54,7 @@ class CreateProductRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     description: str = Field(min_length=1, max_length=5000)
     category_id: str
-    images: list[Image] = Field(min_length=1)
+    images: list[Image] = Field(default_factory=list)
     characteristics: list[Characteristic] = Field(default_factory=list)
 
     @field_validator("category_id")
@@ -78,10 +80,16 @@ class ProductResponse(BaseModel):
     status: str
     deleted: bool
     blocked: bool
+    category_id: str
     category: CategoryRef
+    slug: str
     images: list[Image]
     characteristics: list[Characteristic]
     skus: list[Any]
+    blocking_reason_id: str | None = None
+    moderator_comment: str | None = None
+    created_at: str
+    updated_at: str
 
 
 @dataclass
@@ -90,6 +98,8 @@ class ProductStore:
 
     def create(self, payload: CreateProductRequest, seller_id: str) -> ProductResponse:
         product_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        slug = re.sub(r"[^a-z0-9]+", "-", payload.title.lower()).strip("-") or product_id
         product = ProductResponse(
             id=product_id,
             seller_id=seller_id,
@@ -98,6 +108,7 @@ class ProductStore:
             status="CREATED",
             deleted=False,
             blocked=False,
+            category_id=payload.category_id,
             category=CategoryRef(
                 id=payload.category_id,
                 name=CATEGORY_NAMES.get(payload.category_id, "Category"),
@@ -105,6 +116,11 @@ class ProductStore:
             images=payload.images,
             characteristics=payload.characteristics,
             skus=[],
+            slug=slug,
+            blocking_reason_id=None,
+            moderator_comment=None,
+            created_at=now,
+            updated_at=now,
         )
         self.products[product_id] = product
         return product

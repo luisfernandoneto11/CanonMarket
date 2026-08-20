@@ -44,6 +44,12 @@ def test_create_product_returns_201_with_created_status():
     assert body["skus"] == []
     assert body["deleted"] is False
     assert body["blocked"] is False
+    assert body["category_id"] == CATEGORY_ID
+    assert body["slug"] == "iphone-15-pro-max"
+    assert body["blocking_reason_id"] is None
+    assert body["moderator_comment"] is None
+    assert body["created_at"].endswith("Z")
+    assert body["updated_at"].endswith("Z")
 
 
 def test_seller_id_taken_from_jwt():
@@ -58,7 +64,7 @@ def test_seller_id_taken_from_jwt():
     assert response.json()["seller_id"] == SELLER_ID
 
 
-def test_missing_images_returns_400():
+def test_missing_images_defaults_to_empty_list():
     payload = product_payload()
     del payload["images"]
 
@@ -66,11 +72,10 @@ def test_missing_images_returns_400():
         "/api/v1/products", json=payload, headers={"Authorization": f"Bearer {jwt_for()}"}
     )
 
-    assert response.status_code == 400
-    assert response.json() == {
-        "code": "INVALID_REQUEST",
-        "message": "At least one image is required",
-    }
+    assert response.status_code == 201
+    body = response.json()
+    assert body["images"] == []
+    assert body["status"] == "CREATED"
 
 
 def test_missing_category_returns_400():
