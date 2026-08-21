@@ -1029,6 +1029,15 @@ def test_cancel_response_contains_contract_order_fields():
     assert body["subtotal"] == body["total"] == body["total_amount"]
     assert "address" in body
     assert body["created_at"]
+    assert isinstance(body["items"], list) and body["items"]
+    assert set(body["items"][0]) >= {"sku_id", "product_id", "product_title", "sku_name", "quantity", "unit_price", "line_total"}
+
+
+def test_cancel_order_response_openapi_matches_order_contract():
+    from app.main import app
+    schema = app.openapi()["components"]["schemas"]["OrderResponse"]
+    assert set(schema["required"]) >= {"id", "user_id", "buyer_id", "status", "subtotal", "total", "total_amount", "idempotency_key", "address", "created_at", "items"}
+    assert set(schema["properties"]["items"]["items"]["$ref"].split("/")[-1:]) == {"OrderItemResponse"}
 
 
 def test_other_user_order_returns_404():

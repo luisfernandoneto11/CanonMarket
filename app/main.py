@@ -461,7 +461,7 @@ class OrderResponse(BaseModel):
     total: int
     total_amount: int
     idempotency_key: str
-    address: str | None = None
+    address: str | None
     delivery_address: str | None = None
     created_at: str
     items: list[OrderItemResponse]
