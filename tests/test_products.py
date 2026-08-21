@@ -1097,10 +1097,10 @@ def test_approval_event_is_delivered_to_b2b(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert calls[0]["url"] == "https://b2b.internal/api/v1/moderation/events"
-    assert calls[0]["json"]["event_type"] == "PRODUCT_MODERATED"
-    assert calls[0]["json"]["occurred_at"]
-    assert calls[0]["json"]["payload"]["product_id"] == product_id
+    assert calls[0]["url"] == "https://b2b.internal/api/v1/events/moderation"
+    assert calls[0]["json"]["status"] == "MODERATED"
+    assert calls[0]["json"]["product_id"] == product_id
+    assert "event_type" not in calls[0]["json"]
 
 
 def test_approve_after_edited_returns_409():

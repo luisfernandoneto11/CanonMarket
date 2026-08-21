@@ -702,32 +702,24 @@ class ProductStore:
             return existing
         if os.getenv("B2B_MODERATION_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
             raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
-        occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         event = {
             "event_key": event_key,
             "idempotency_key": str(uuid.uuid5(uuid.NAMESPACE_URL, event_key)),
-            "event_type": "PRODUCT_MODERATED" if status_value == "MODERATED" else "PRODUCT_BLOCKED",
-            "occurred_at": occurred_at,
-            "payload": {
-                "product_id": product.id,
-                "status": status_value,
-                "hard_block": hard_block,
-            },
             "product_id": product.id,
             "status": status_value,
             "hard_block": hard_block,
         }
         if blocking_reason is not None:
             event["blocking_reason"] = blocking_reason.model_dump()
-            event["payload"]["blocking_reason"] = blocking_reason.model_dump()
         b2b_url = os.getenv("B2B_URL") or os.getenv("B2B_MODERATION_URL")
         if b2b_url:
             response = httpx.post(
-                f"{b2b_url.rstrip('/')}/api/v1/moderation/events",
+                f"{b2b_url.rstrip('/')}/api/v1/events/moderation",
                 headers={"X-Service-Key": os.getenv("MOD_TO_B2B_KEY", "development-service-key")},
-                json=event,
+                json={key: value for key, value in event.items() if key != "event_key"},
                 timeout=5.0,
             )
+
             if response.status_code not in {200, 202, 204}:
                 raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
         self.moderation_outgoing_events.append(event)
