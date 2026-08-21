@@ -1206,10 +1206,11 @@ def test_ticket_block_returns_complete_response_and_delivers_b2b(monkeypatch):
     assert body["id"] == product_id
     assert body["product_id"] == product_id
     assert body["status"] == "HARD_BLOCKED"
-    assert calls[0]["url"] == "https://b2b.internal/api/v1/moderation/events"
-    assert calls[0]["json"]["event_type"] == "PRODUCT_BLOCKED"
-    assert calls[0]["json"]["payload"]["hard_block"] is True
-    assert calls[0]["json"]["payload"]["status"] == "BLOCKED"
+    assert calls[0]["url"] == "https://b2b.internal/api/v1/events/moderation"
+    assert calls[0]["json"]["status"] == "BLOCKED"
+    assert calls[0]["json"]["hard_block"] is True
+    assert calls[0]["json"]["product_id"] == product_id
+    assert "event_type" not in calls[0]["json"]
 
 
 def test_b2b_wrapped_edited_event_is_ignored_after_hard_block():

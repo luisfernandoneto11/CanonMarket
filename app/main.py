@@ -10,7 +10,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Annotated, Any, Callable
+from typing import Annotated, Any, Callable, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -355,7 +355,7 @@ class ModerationDeclineRequest(BaseModel):
     comment: str | None = Field(default=None, max_length=2000)
     moderator_comment: str | None = Field(default=None, max_length=1000)
     field_reports: list[FieldReport] = Field(default_factory=list)
-    hard_block: bool = False
+    hard_block: Literal[True]
 
 
 class TicketResponse(BaseModel):
@@ -727,30 +727,21 @@ class ProductStore:
             return
         if os.getenv("B2B_MODERATION_UNAVAILABLE", "").lower() in {"1", "true", "yes"}:
             raise HTTPException(status_code=503, detail=ApiError(code="B2B_UNAVAILABLE", message="B2B moderation service unavailable").model_dump())
-        occurred_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         event = {
             "event_key": event_key,
             "idempotency_key": str(uuid.uuid5(uuid.NAMESPACE_URL, event_key)),
-            "event_type": "PRODUCT_BLOCKED" if status_value == "BLOCKED" else "PRODUCT_MODERATED",
-            "occurred_at": occurred_at,
-            "payload": {
-                "product_id": product.id,
-                "status": status_value,
-                "hard_block": hard_block,
-            },
             "product_id": product.id,
             "status": status_value,
             "hard_block": hard_block,
         }
         if blocking_reason is not None:
             event["blocking_reason"] = blocking_reason.model_dump()
-            event["payload"]["blocking_reason"] = blocking_reason.model_dump()
         b2b_url = os.getenv("B2B_URL") or os.getenv("B2B_MODERATION_URL")
         if b2b_url:
             response = httpx.post(
-                f"{b2b_url.rstrip('/')}/api/v1/moderation/events",
+                f"{b2b_url.rstrip('/')}/api/v1/events/moderation",
                 headers={"X-Service-Key": os.getenv("MOD_TO_B2B_KEY", "development-service-key")},
-                json=event,
+                json={key: value for key, value in event.items() if key != "event_key"},
                 timeout=5.0,
             )
             if response.status_code not in {200, 202, 204}:
@@ -777,7 +768,7 @@ class ProductStore:
         self.moderator_assignments.pop(product_id, None)
         return ModerationActionResponse(product_id=product.id, status=product.status)
 
-    def hard_block_product(self, product_id: str, moderator_id: str, payload: ModerationDeclineRequest) -> ModerationActionResponse:
+    def hard_block_product(self, product_id: str, moderator_id: str, payload: ModerationDeclineRequest) -> TicketResponse:
         product = self.products.get(product_id)
         if product is None:
             raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Product not found in moderation queue").model_dump())
@@ -795,7 +786,15 @@ class ProductStore:
         product.blocking_reason = payload.blocking_reason
         product.field_reports = payload.field_reports
         self.moderator_assignments.pop(product_id, None)
-        return ModerationActionResponse(product_id=product.id, status=product.status)
+        return TicketResponse(
+            id=product.id,
+            product_id=product.id,
+            seller_id=product.seller_id,
+            kind="PRODUCT_MODERATION",
+            status=product.status,
+            queue_priority=0,
+            created_at=getattr(product, "created_at", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+        )
 
     def apply_product_event(self, payload: ProductEventRequest) -> ProductEventResponse:
         product = self.products.get(payload.product_id)
@@ -1671,17 +1670,7 @@ def block_ticket(
         raise HTTPException(status_code=404, detail=ApiError(code="NOT_FOUND", message="Ticket not found").model_dump()) from None
     if not payload.hard_block:
         raise HTTPException(status_code=400, detail=ApiError(code="INVALID_REQUEST", message="hard_block must be true").model_dump())
-    result = store.hard_block_product(ticket_id, moderator_id, payload)
-    product = store.products[ticket_id]
-    return TicketResponse(
-        id=ticket_id,
-        product_id=product.id,
-        seller_id=product.seller_id,
-        kind="PRODUCT_MODERATION",
-        status=result.status,
-        queue_priority=0,
-        created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    )
+    return store.hard_block_product(ticket_id, moderator_id, payload)
 
 
 @app.post(
